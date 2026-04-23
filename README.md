@@ -4,7 +4,7 @@
 <div align="center">
  <h1> LLaDA2.0-Uni: Unifying Multimodal Understanding and Generation with Diffusion Large Language Model </h1>
 
-  [[📑 Technical Report ]()] &emsp; [[🤗 Model ](https://huggingface.co/inclusionAI/LLaDA2.0-Uni)]
+  [[📑 Technical Report ](https://arxiv.org/abs/2604.20796)] &emsp; [[🤗 Model ](https://huggingface.co/inclusionAI/LLaDA2.0-Uni)]
  
  <b>AGI Research Center, Inclusion AI </b>
 </div>
