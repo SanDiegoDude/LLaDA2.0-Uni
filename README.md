@@ -280,7 +280,7 @@ This project is licensed under the terms of the [Apache License 2.0](https://www
 @article{LLaDA2Uni,
 title = {LLaDA2.0-Uni: Unifying Multimodal Understanding and Generation with Diffusion Large Language Model},
 author = {Tiwei Bie and Haoxing Chen and Tieyuan Chen and Zhenglin Cheng and Long Cui and Kai Gan and Zhicheng Huang and Zhenzhong Lan and Haoquan Li and Jianguo Li and Tao Lin and Qi Qin and Hongjun Wang and Xiaomei Wang and Haoyuan Wu and Yi Xin and Junbo Zhao},
-journal={arXiv preprint arXiv:2604.20796},
+journal = {arXiv preprint arXiv:2604.20796},
 year = {2026}
 }
 ```
