@@ -609,8 +609,8 @@ def build_app(pipe: Pipeline):
                         t2i_h = gr.Slider(256, 2048, 1024, step=64, label="Image H (px)")
                         t2i_w = gr.Slider(256, 2048, 1024, step=64, label="Image W (px)")
                     with gr.Row():
-                        t2i_llm_steps = gr.Slider(2, 32, 8, step=1, label="LLM steps")
-                        t2i_cfg = gr.Slider(0.0, 10.0, 2.0, step=0.1, label="LLM CFG scale")
+                        t2i_llm_steps = gr.Slider(1, 32, 8, step=1, label="LLM steps")
+                        t2i_cfg = gr.Slider(1.0, 10.0, 2.0, step=0.1, label="LLM CFG scale")
                     with gr.Row():
                         t2i_mode = gr.Radio(
                             ["turbo", "normal"], value="turbo",
@@ -624,7 +624,8 @@ def build_app(pipe: Pipeline):
                         t2i_seed = gr.Number(value=42, label="Seed", precision=0)
                     t2i_go = gr.Button("Generate", variant="primary")
                 with gr.Column(scale=3):
-                    t2i_img = gr.Image(label="Output", type="pil", height=600)
+                    t2i_img = gr.Image(label="Output", type="pil", height=600,
+                                       format="png")
                     t2i_info = gr.Markdown("", elem_classes="status-box")
 
             def run_t2i(prompt, h, w, ls, cfg, mode, ds, seed,
@@ -716,10 +717,14 @@ def build_app(pipe: Pipeline):
                     with gr.Row():
                         ed_input = gr.Slider(512, 1536, 1024, step=128,
                                              label="Input size (px)")
-                        ed_steps = gr.Slider(2, 32, 8, step=1, label="LLM steps")
+                        ed_steps = gr.Slider(1, 32, 8, step=1, label="LLM steps")
                         ed_blk = gr.Slider(16, 64, 32, step=4, label="Block length")
                     with gr.Row():
-                        ed_cfg_t = gr.Slider(0.0, 10.0, 4.0, step=0.1, label="CFG text")
+                        # Text CFG min 1.0: 0 means "ignore the prompt", which
+                        # makes the whole call pointless. Image CFG can stay 0
+                        # because that's a meaningful value (== don't condition
+                        # on the source image, useful for radical edits).
+                        ed_cfg_t = gr.Slider(1.0, 10.0, 4.0, step=0.1, label="CFG text")
                         ed_cfg_i = gr.Slider(0.0, 10.0, 0.0, step=0.1, label="CFG image")
                     with gr.Row():
                         ed_mode = gr.Radio(["turbo", "normal"], value="turbo",
@@ -728,7 +733,8 @@ def build_app(pipe: Pipeline):
                     ed_seed = gr.Number(value=42, label="Seed", precision=0)
                     ed_go = gr.Button("Edit", variant="primary")
                 with gr.Column(scale=3):
-                    ed_out = gr.Image(label="Output", type="pil", height=500)
+                    ed_out = gr.Image(label="Output", type="pil", height=500,
+                                      format="png")
                     ed_info = gr.Markdown("", elem_classes="status-box")
 
             def run_edit(path, instr, isz, stp, blk, ct, ci, mode, ds, seed,
@@ -784,10 +790,19 @@ def build_app(pipe: Pipeline):
                     rep_ds = gr.Slider(2, 50, 8, step=1, label="Decoder steps")
                     rep_seed = gr.Number(value=42, label="Seed", precision=0)
                     rep_go = gr.Button("Re-decode", variant="primary")
+                    gr.Markdown(
+                        "Save the last in-memory VQ tokens to "
+                        "`outputs/last-run.pt` so you can re-decode after "
+                        "a restart, share with someone, or feed back in:"
+                    )
+                    rep_save = gr.Button("Save last-run.pt", variant="secondary")
+                    rep_dl = gr.File(label="Download", visible=False,
+                                     interactive=False)
                     gr.Markdown("Or upload a saved `.pt` tokens file:")
                     rep_upload = gr.File(label="VQ tokens (.pt)", file_types=[".pt"])
                 with gr.Column(scale=3):
-                    rep_out = gr.Image(label="Output", type="pil", height=500)
+                    rep_out = gr.Image(label="Output", type="pil", height=500,
+                                       format="png")
                     rep_info = gr.Markdown("", elem_classes="status-box")
 
             def run_replay(mode, ds, seed, upload,
@@ -841,6 +856,21 @@ def build_app(pipe: Pipeline):
                 [rep_out, rep_info],
             )
             rep_mode.change(_steps_for_mode, rep_mode, rep_ds)
+
+            def save_last_vq():
+                if pipe.last_vq is None:
+                    raise gr.Error(
+                        "No VQ tokens cached yet — generate (T2I) or edit "
+                        "an image first, then come back here."
+                    )
+                out_dir = os.path.join(_REPO_ROOT, "outputs")
+                os.makedirs(out_dir, exist_ok=True)
+                path = os.path.join(out_dir, "last-run.pt")
+                torch.save(pipe.last_vq, path)
+                print(f"[replay] saved last VQ tokens to {path}")
+                return gr.update(value=path, visible=True)
+
+            rep_save.click(save_last_vq, None, rep_dl)
 
         # ---- Status / Info ----
         with gr.Tab("Status"):
