@@ -154,12 +154,64 @@ during that loop.
 python scripts/ui.py --quant nf4 --low_vram --host 0.0.0.0 --port 7860
 ```
 
+#### Load-on-demand (`--lod`)
+
+For a long-running server that shouldn't hog the GPU when idle:
+
+```bash
+python scripts/ui.py --quant nf4 --lod --host 0.0.0.0 --port 7860
+```
+
+After each request completes, every component (LLM, decoder, VAE,
+image tokenizer, SigVQ) is unloaded from GPU memory. Between
+requests the process sits at ~0 GB VRAM. Every request pays the full
+~90 s cold-start penalty. `--lod` is stronger than `--low_vram` and
+implies it. Use this when you want to park the server on a shared box
+and still keep the GPU free for other workloads between jobs.
+
+#### HTTP API (`--api`, pairs with `--lod`)
+
+```bash
+python scripts/ui.py --quant nf4 --lod --api --host 0.0.0.0 --port 7860
+```
+
+Now, on the same port:
+
+- `http://host:7860/ui`   — the Gradio UI
+- `http://host:7860/api/` — REST endpoints (FastAPI)
+- `http://host:7860/docs` — auto-generated OpenAPI explorer
+
+Endpoints (all POST JSON, return JSON; images are base64-encoded PNG
+inline, nothing is written to disk on the server):
+
+| Path | What it does |
+|---|---|
+| `POST /api/t2i` | `{prompt, image_h, image_w, llm_steps, cfg_scale, decoder_mode, decoder_steps, seed}` → `{image_base64, meta, timing}` |
+| `POST /api/edit` | `{image_base64, instruction, input_size, llm_steps, block_length, cfg_text_scale, cfg_image_scale, decoder_mode, decoder_steps, seed}` → `{image_base64, meta, timing}` |
+| `POST /api/mmu` | `{image_base64, question, llm_steps, block_length, gen_length, seed}` → `{answer, timing}` |
+| `GET /api/status` | pipeline state, loaded components, CUDA memory |
+
+`decoder_mode` is `"turbo"` (default, 8-step distilled) or `"normal"`
+(50-step, higher fidelity, slower). `decoder_steps` overrides the mode
+default if provided. Everything else has a sensible default; the
+minimal t2i call is just `{"prompt": "..."}`.
+
+Quick test:
+
+```bash
+curl -X POST http://localhost:7860/api/t2i \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"a neon-lit cyberpunk fox, cinematic"}' \
+  | python -c "import sys,json,base64; d=json.loads(sys.stdin.read()); open('out.png','wb').write(base64.b64decode(d['image_base64'])); print('meta:', d['meta']); print('timing:', d['timing'])"
+```
+
 #### Other useful UI flags
 
 - `--no-eager-load` — don't load the LLM at startup (defer to first
   request). Makes startup instant but the first generation pays the
-  full reload cost.
-- `--share` — expose a public `gradio.live` URL.
+  full reload cost. Implied by `--lod`.
+- `--share` — expose a public `gradio.live` URL (UI-only, no effect
+  when `--api` is set — use a reverse proxy for public API access).
 - `--quant {nf4,fp8,bf16}` — swap backbone precision. Weights for the
   requested quant auto-download on first use.
 

@@ -36,12 +36,15 @@ fine without passing heavy objects through `gr.State`.
 from __future__ import annotations
 
 import argparse
+import base64
 import gc
 import io
 import json
 import os
 import sys
+import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -59,6 +62,11 @@ os.environ.setdefault("PYTHONUNBUFFERED", "1")
 import warnings  # noqa: E402
 
 warnings.filterwarnings("ignore", message=r".*incorrect regex pattern.*")
+
+# Locked decoder scale. Anything other than 2 (the training-time value)
+# produces visibly degraded output — mushy edges, wrong aspect handling,
+# or outright artifacts. Keeping the dial exposed to users was a footgun.
+_FIXED_RES_MULT = 2
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
@@ -93,6 +101,11 @@ class Pipeline:
     # would otherwise clip. Pays ~75 s LLM reload between every generation, but
     # decoder-replay stays instant once warm.
     low_vram: bool = False
+    # "Load on demand": unload ALL components after each request completes,
+    # so the process sits at ~0 GB VRAM between requests. Pays the full
+    # reload cost every call. Useful for leaving the API server running
+    # long-term without hogging GPU memory.
+    lod: bool = False
 
     llm: object | None = None
     tokenizer: object | None = None
@@ -229,6 +242,45 @@ class Pipeline:
         gc.collect()
         torch.cuda.empty_cache()
 
+    def unload_sigvq(self) -> None:
+        if self.sigvq is None:
+            return
+        print("[SigVQ] unloading")
+        del self.sigvq
+        self.sigvq = None
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def unload_vae(self) -> None:
+        if self.vae is None:
+            return
+        print("[VAE] unloading")
+        del self.vae
+        self.vae = None
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def unload_all(self) -> None:
+        """Drop everything from GPU. Used by --lod after each request."""
+        self.unload_llm()
+        self.unload_decoder()
+        self.unload_image_tokenizer()
+        self.unload_sigvq()
+        self.unload_vae()
+
+    def finalize_request(self) -> None:
+        """Run at the end of every UI / API request (in a finally block).
+
+        Currently a no-op unless ``--lod`` is on, in which case it flushes
+        every weight back out of GPU memory so the process idles near 0 GB.
+        """
+        if self.lod:
+            print("[lod] request finished, unloading everything")
+            t0 = time.time()
+            self.unload_all()
+            print(f"[lod] idle after {time.time() - t0:.1f}s, "
+                  f"CUDA={torch.cuda.memory_allocated() / 1e9:.2f} GB")
+
     # --- decode primitives ---
     @torch.inference_mode()
     def decode(
@@ -248,8 +300,10 @@ class Pipeline:
 
         # Make room for the decoder before loading it. The LLM + decoder+
         # VAE combo pushes ~22 GB of model weights alone, which is too close
-        # to the limit on 24 GB consumer GPUs.
-        if self.low_vram:
+        # to the limit on 24 GB consumer GPUs. Both low_vram and lod trigger
+        # this swap (lod unloads everything AFTER the request, low_vram just
+        # during transitions).
+        if self.low_vram or self.lod:
             self.unload_llm()
             self.unload_image_tokenizer()
 
@@ -339,9 +393,8 @@ class Pipeline:
         cfg_scale: float, decoder_mode: str, decoder_steps: int | None,
         resolution_multiplier: int, seed: int, progress_cb=None,
     ) -> tuple[Image.Image, dict, float, float]:
-        # In low_vram mode, ensure the decoder isn't hogging GPU while we bring
-        # the LLM back up.
-        if self.low_vram:
+        # Free the decoder before bringing the LLM up (low_vram / lod).
+        if self.low_vram or self.lod:
             self.unload_decoder()
         self.load_llm()
         torch.manual_seed(seed)
@@ -393,7 +446,7 @@ class Pipeline:
     ) -> tuple[str, float]:
         from decoder.utils import generate_crop_size_list, var_center_crop
 
-        if self.low_vram:
+        if self.low_vram or self.lod:
             self.unload_decoder()
         self.load_llm()
         self.load_image_tokenizer()
@@ -423,7 +476,7 @@ class Pipeline:
     ) -> tuple[Image.Image, dict, float, float]:
         from decoder.utils import generate_crop_size_list, var_center_crop
 
-        if self.low_vram:
+        if self.low_vram or self.lod:
             self.unload_decoder()
         self.load_llm()
         self.load_image_tokenizer()
@@ -518,7 +571,6 @@ def build_app(pipe: Pipeline):
                             2, 50, 8, step=1,
                             label="Decoder steps (auto if default)",
                         )
-                        t2i_mult = gr.Slider(1, 4, 2, step=1, label="Resolution ×")
                     with gr.Row():
                         t2i_seed = gr.Number(value=42, label="Seed", precision=0)
                     t2i_go = gr.Button("Generate", variant="primary")
@@ -526,7 +578,7 @@ def build_app(pipe: Pipeline):
                     t2i_img = gr.Image(label="Output", type="pil", height=600)
                     t2i_info = gr.Markdown("", elem_classes="status-box")
 
-            def run_t2i(prompt, h, w, ls, cfg, mode, ds, mult, seed,
+            def run_t2i(prompt, h, w, ls, cfg, mode, ds, seed,
                         progress=gr.Progress()):
                 if not prompt.strip():
                     raise gr.Error("Prompt is empty")
@@ -534,22 +586,25 @@ def build_app(pipe: Pipeline):
                 def cb(frac, msg):
                     progress(frac, desc=msg)
 
-                progress(0.0, desc="LLM warming up …")
-                img, meta, t_llm, t_dec = pipe.t2i(
-                    prompt, int(h), int(w), int(ls), float(cfg),
-                    mode, int(ds), int(mult), int(seed), cb,
-                )
-                info = (f"LLM: {t_llm:.1f}s · Decoder: {t_dec:.1f}s · "
-                        f"Total: {t_llm + t_dec:.1f}s\n\n"
-                        f"Tokens: {meta['image_h'] // 32} × {meta['image_w'] // 32} = "
-                        f"{(meta['image_h'] // 32) * (meta['image_w'] // 32)} "
-                        f"· CUDA: {torch.cuda.memory_allocated() / 1e9:.1f} GB")
-                return img, info
+                try:
+                    progress(0.0, desc="LLM warming up …")
+                    img, meta, t_llm, t_dec = pipe.t2i(
+                        prompt, int(h), int(w), int(ls), float(cfg),
+                        mode, int(ds), _FIXED_RES_MULT, int(seed), cb,
+                    )
+                    info = (f"LLM: {t_llm:.1f}s · Decoder: {t_dec:.1f}s · "
+                            f"Total: {t_llm + t_dec:.1f}s\n\n"
+                            f"Tokens: {meta['image_h'] // 32} × {meta['image_w'] // 32} = "
+                            f"{(meta['image_h'] // 32) * (meta['image_w'] // 32)} "
+                            f"· CUDA: {torch.cuda.memory_allocated() / 1e9:.1f} GB")
+                    return img, info
+                finally:
+                    pipe.finalize_request()
 
             t2i_go.click(
                 run_t2i,
                 [t2i_prompt, t2i_h, t2i_w, t2i_llm_steps, t2i_cfg,
-                 t2i_mode, t2i_dec_steps, t2i_mult, t2i_seed],
+                 t2i_mode, t2i_dec_steps, t2i_seed],
                 [t2i_img, t2i_info],
             )
 
@@ -575,8 +630,11 @@ def build_app(pipe: Pipeline):
             def run_mmu(path, q, s, bl, gl, seed):
                 if not path:
                     raise gr.Error("Upload an image first.")
-                ans, t = pipe.mmu(path, q, int(s), int(bl), int(gl), int(seed))
-                return ans, f"LLM: {t:.1f}s"
+                try:
+                    ans, t = pipe.mmu(path, q, int(s), int(bl), int(gl), int(seed))
+                    return ans, f"LLM: {t:.1f}s"
+                finally:
+                    pipe.finalize_request()
 
             mmu_go.click(run_mmu,
                          [mmu_img, mmu_q, mmu_steps, mmu_blk, mmu_len, mmu_seed],
@@ -603,14 +661,13 @@ def build_app(pipe: Pipeline):
                         ed_mode = gr.Radio(["turbo", "normal"], value="turbo",
                                            label="Decoder")
                         ed_ds = gr.Slider(2, 50, 8, step=1, label="Decoder steps")
-                        ed_mult = gr.Slider(1, 4, 2, step=1, label="Resolution ×")
                     ed_seed = gr.Number(value=42, label="Seed", precision=0)
                     ed_go = gr.Button("Edit", variant="primary")
                 with gr.Column(scale=3):
                     ed_out = gr.Image(label="Output", type="pil", height=500)
                     ed_info = gr.Markdown("", elem_classes="status-box")
 
-            def run_edit(path, instr, isz, stp, blk, ct, ci, mode, ds, mult, seed,
+            def run_edit(path, instr, isz, stp, blk, ct, ci, mode, ds, seed,
                          progress=gr.Progress()):
                 if not path:
                     raise gr.Error("Upload a source image first.")
@@ -620,21 +677,24 @@ def build_app(pipe: Pipeline):
                 def cb(frac, msg):
                     progress(frac, desc=msg)
 
-                progress(0.0, desc="Tokenizing …")
-                img, meta, t_llm, t_dec = pipe.edit(
-                    path, instr, int(isz), int(stp), int(blk),
-                    float(ct), float(ci), mode, int(ds),
-                    int(mult), int(seed), cb,
-                )
-                info = (f"LLM: {t_llm:.1f}s · Decoder: {t_dec:.1f}s · "
-                        f"Total: {t_llm + t_dec:.1f}s\n\n"
-                        f"CUDA: {torch.cuda.memory_allocated() / 1e9:.1f} GB")
-                return img, info
+                try:
+                    progress(0.0, desc="Tokenizing …")
+                    img, meta, t_llm, t_dec = pipe.edit(
+                        path, instr, int(isz), int(stp), int(blk),
+                        float(ct), float(ci), mode, int(ds),
+                        _FIXED_RES_MULT, int(seed), cb,
+                    )
+                    info = (f"LLM: {t_llm:.1f}s · Decoder: {t_dec:.1f}s · "
+                            f"Total: {t_llm + t_dec:.1f}s\n\n"
+                            f"CUDA: {torch.cuda.memory_allocated() / 1e9:.1f} GB")
+                    return img, info
+                finally:
+                    pipe.finalize_request()
 
             ed_go.click(
                 run_edit,
                 [ed_img, ed_instr, ed_input, ed_steps, ed_blk, ed_cfg_t, ed_cfg_i,
-                 ed_mode, ed_ds, ed_mult, ed_seed],
+                 ed_mode, ed_ds, ed_seed],
                 [ed_out, ed_info],
             )
 
@@ -650,7 +710,6 @@ def build_app(pipe: Pipeline):
                     rep_mode = gr.Radio(["turbo", "normal"], value="turbo",
                                         label="Decoder")
                     rep_ds = gr.Slider(2, 50, 8, step=1, label="Decoder steps")
-                    rep_mult = gr.Slider(1, 4, 2, step=1, label="Resolution ×")
                     rep_seed = gr.Number(value=42, label="Seed", precision=0)
                     rep_go = gr.Button("Re-decode", variant="primary")
                     gr.Markdown("Or upload a saved `.pt` tokens file:")
@@ -659,7 +718,7 @@ def build_app(pipe: Pipeline):
                     rep_out = gr.Image(label="Output", type="pil", height=500)
                     rep_info = gr.Markdown("", elem_classes="status-box")
 
-            def run_replay(mode, ds, mult, seed, upload,
+            def run_replay(mode, ds, seed, upload,
                            progress=gr.Progress()):
                 if upload is not None:
                     payload = torch.load(upload, map_location="cpu",
@@ -680,23 +739,26 @@ def build_app(pipe: Pipeline):
                 def cb(frac, msg):
                     progress(frac, desc=msg)
 
-                t0 = time.time()
-                img = pipe.decode(
-                    tok_ids, h, w, decoder_mode=mode,
-                    num_steps=int(ds), resolution_multiplier=int(mult),
-                    seed=int(seed), progress_cb=cb,
-                )
-                dt = time.time() - t0
-                info = (
-                    f"Decoder: {dt:.1f}s · grid {h}×{w} · "
-                    f"source task: {meta.get('task','?')} · "
-                    f"'{(meta.get('prompt') or meta.get('instruction') or '')[:80]}'"
-                )
-                return img, info
+                try:
+                    t0 = time.time()
+                    img = pipe.decode(
+                        tok_ids, h, w, decoder_mode=mode,
+                        num_steps=int(ds), resolution_multiplier=_FIXED_RES_MULT,
+                        seed=int(seed), progress_cb=cb,
+                    )
+                    dt = time.time() - t0
+                    info = (
+                        f"Decoder: {dt:.1f}s · grid {h}×{w} · "
+                        f"source task: {meta.get('task','?')} · "
+                        f"'{(meta.get('prompt') or meta.get('instruction') or '')[:80]}'"
+                    )
+                    return img, info
+                finally:
+                    pipe.finalize_request()
 
             rep_go.click(
                 run_replay,
-                [rep_mode, rep_ds, rep_mult, rep_seed, rep_upload],
+                [rep_mode, rep_ds, rep_seed, rep_upload],
                 [rep_out, rep_info],
             )
 
@@ -710,6 +772,7 @@ def build_app(pipe: Pipeline):
                     f"**Model path:** `{pipe.model_path}`",
                     f"**CUDA mem:** {torch.cuda.memory_allocated() / 1e9:.2f} GB",
                     f"**low_vram:** {'on (swapping enabled)' if pipe.low_vram else 'off'}",
+                    f"**lod:** {'on (cold-start every request)' if pipe.lod else 'off'}",
                     "",
                     "### Loaded components",
                     f"- LLM: {'✓ loaded' if pipe.llm is not None else '— not loaded'}",
@@ -732,33 +795,218 @@ def build_app(pipe: Pipeline):
     return app
 
 
+# ---------------------------------------------------------------------------
+# FastAPI HTTP API (for programmatic / ComfyUI access)
+# ---------------------------------------------------------------------------
+def _pil_to_b64(img: Image.Image, fmt: str = "PNG") -> str:
+    """Encode a PIL image → base64 string, never touching the disk."""
+    buf = io.BytesIO()
+    img.save(buf, format=fmt)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+@contextmanager
+def _b64_to_tempfile(b64: str, suffix: str = ".png"):
+    """Write a base64-decoded image to a temp file, yield path, cleanup on exit.
+
+    Needed because Pipeline.edit / Pipeline.mmu call ``Image.open(path)``
+    inside ``var_center_crop`` — refactoring them to accept bytes or a PIL
+    image would touch model-internal code paths, temp files are safer.
+    """
+    fd, path = tempfile.mkstemp(suffix=suffix)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(base64.b64decode(b64))
+        yield path
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def build_api(pipe: "Pipeline"):
+    """Construct a FastAPI app exposing t2i / edit / mmu / decode / status.
+
+    All image I/O is in-memory base64. Nothing touches the disk beyond a
+    transient tempfile for the input side of edit / mmu (deleted before
+    the response is returned).
+    """
+    from fastapi import FastAPI, HTTPException
+    from pydantic import BaseModel, Field
+
+    class T2IRequest(BaseModel):
+        prompt: str
+        image_h: int = 1024
+        image_w: int = 1024
+        llm_steps: int = 8
+        cfg_scale: float = 2.0
+        decoder_mode: str = Field("turbo", pattern="^(turbo|normal)$")
+        decoder_steps: Optional[int] = None
+        seed: int = 42
+
+    class EditRequest(BaseModel):
+        image_base64: str
+        instruction: str
+        input_size: int = 1024
+        llm_steps: int = 8
+        block_length: int = 32
+        cfg_text_scale: float = 4.0
+        cfg_image_scale: float = 0.0
+        decoder_mode: str = Field("turbo", pattern="^(turbo|normal)$")
+        decoder_steps: Optional[int] = None
+        seed: int = 42
+
+    class MMURequest(BaseModel):
+        image_base64: str
+        question: str = "Describe this image in detail."
+        llm_steps: int = 32
+        block_length: int = 32
+        gen_length: int = 256
+        seed: int = 42
+
+    api = FastAPI(
+        title="LLaDA-2.0-Uni API",
+        version="0.1.0",
+        description=(
+            "HTTP API around the LLaDA-2.0-Uni unified dLLM. All responses "
+            "return base64-encoded PNG data inline; nothing is written to "
+            "disk by the server. Pair with ``--lod`` to idle at 0 GB VRAM "
+            "between calls."
+        ),
+    )
+
+    @api.get("/api/status")
+    def status():
+        return {
+            "quant": pipe.quant,
+            "model_path": pipe.model_path,
+            "device": pipe.device,
+            "low_vram": pipe.low_vram,
+            "lod": pipe.lod,
+            "cuda_allocated_gb": round(
+                torch.cuda.memory_allocated() / 1e9, 3,
+            ),
+            "loaded": {
+                "llm": pipe.llm is not None,
+                "sigvq": pipe.sigvq is not None,
+                "vae": pipe.vae is not None,
+                "image_tokenizer": pipe.image_tokenizer is not None,
+                "decoders": list(pipe.decoder_models.keys()),
+            },
+            "last_vq_cached": bool(pipe.last_vq),
+        }
+
+    @api.post("/api/t2i")
+    def t2i(req: T2IRequest):
+        try:
+            img, meta, t_llm, t_dec = pipe.t2i(
+                req.prompt, req.image_h, req.image_w, req.llm_steps,
+                req.cfg_scale, req.decoder_mode, req.decoder_steps,
+                _FIXED_RES_MULT, req.seed,
+            )
+        except Exception as e:
+            pipe.finalize_request()
+            raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+        pipe.finalize_request()
+        return {
+            "image_base64": _pil_to_b64(img),
+            "format": "png",
+            "meta": meta,
+            "timing": {"t_llm": t_llm, "t_dec": t_dec, "total": t_llm + t_dec},
+        }
+
+    @api.post("/api/edit")
+    def edit(req: EditRequest):
+        try:
+            with _b64_to_tempfile(req.image_base64) as path:
+                img, meta, t_llm, t_dec = pipe.edit(
+                    path, req.instruction, req.input_size, req.llm_steps,
+                    req.block_length, req.cfg_text_scale, req.cfg_image_scale,
+                    req.decoder_mode, req.decoder_steps,
+                    _FIXED_RES_MULT, req.seed,
+                )
+        except Exception as e:
+            pipe.finalize_request()
+            raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+        pipe.finalize_request()
+        # Strip the tempfile path out of meta — it's dead after the request.
+        meta = {k: v for k, v in meta.items() if k != "image"}
+        return {
+            "image_base64": _pil_to_b64(img),
+            "format": "png",
+            "meta": meta,
+            "timing": {"t_llm": t_llm, "t_dec": t_dec, "total": t_llm + t_dec},
+        }
+
+    @api.post("/api/mmu")
+    def mmu(req: MMURequest):
+        try:
+            with _b64_to_tempfile(req.image_base64) as path:
+                answer, t_llm = pipe.mmu(
+                    path, req.question, req.llm_steps, req.block_length,
+                    req.gen_length, req.seed,
+                )
+        except Exception as e:
+            pipe.finalize_request()
+            raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+        pipe.finalize_request()
+        return {
+            "answer": answer,
+            "timing": {"t_llm": t_llm, "total": t_llm},
+        }
+
+    return api
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--quant", choices=["nf4", "fp8", "bf16"], default="nf4")
+    ap.add_argument("--quant", choices=["nf4", "fp8", "bf16"], default="nf4",
+                    help="Backbone precision (default: nf4 — 9.5 GB VRAM)")
     ap.add_argument("--model_path", default=None,
                     help="Override auto-selected dir for --quant")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=7860)
     ap.add_argument("--share", action="store_true",
-                    help="Expose a public gradio.live URL")
+                    help="Expose a public gradio.live URL (UI only, no effect in --api).")
     ap.add_argument("--no-eager-load", action="store_true",
-                    help="Skip loading the LLM at launch (lazy on first request)")
+                    help="Skip loading the LLM at launch (lazy on first request). "
+                         "Implied by --lod.")
     ap.add_argument("--low_vram", action="store_true",
                     help="Swap LLM and decoder on and off GPU so they never "
                          "co-reside. Required for 24 GB cards (4090/3090). "
                          "Adds ~75 s LLM reload between generations.")
+    ap.add_argument("--lod", action="store_true",
+                    help="Load-on-demand: unload EVERYTHING from GPU after each "
+                         "request so the process idles at ~0 GB VRAM. Every call "
+                         "pays the full reload cost (~90 s cold). Great for "
+                         "long-running servers that don't want to hog the GPU.")
+    ap.add_argument("--api", action="store_true",
+                    help="Enable the HTTP API at /api/* (FastAPI). Compatible "
+                         "with --lod. See /docs on the running server for the "
+                         "OpenAPI schema. Images are returned as base64 PNG "
+                         "inline and never saved to disk.")
     args = ap.parse_args()
 
     model_path = _ensure_model_path(args.quant, args.model_path)
     pipe = Pipeline(
         model_path=model_path, quant=args.quant, device=args.device,
-        low_vram=args.low_vram,
+        low_vram=args.low_vram, lod=args.lod,
     )
     if args.low_vram:
         print("[low_vram] enabled — LLM ↔ decoder will be swapped between stages")
+    if args.lod:
+        print("[lod] enabled — all components unload after each request "
+              "(process idles at 0 GB VRAM)")
 
-    if not args.no_eager_load:
+    # --lod implies no eager load: pointless to load the LLM only to tear it
+    # right back down the first time finalize_request runs.
+    eager = (not args.no_eager_load) and (not args.lod)
+    if eager:
         print("Eager-loading LLM backbone at startup; pass --no-eager-load to skip.")
         pipe.load_llm()
     else:
@@ -766,11 +1014,32 @@ def main() -> None:
 
     import gradio as gr
 
-    app = build_app(pipe)
-    app.launch(
-        server_name=args.host, server_port=args.port, share=args.share,
-        show_error=True, theme=gr.themes.Soft(),
-    )
+    gradio_app = build_app(pipe)
+
+    if args.api:
+        # Mount the Gradio UI inside a FastAPI app so both the /ui and the
+        # /api/* endpoints share a single uvicorn server and a single pipe.
+        import uvicorn
+        from fastapi.responses import RedirectResponse
+
+        api = build_api(pipe)
+
+        # Redirect root to the UI so bare http://host:port/ still gives humans
+        # something useful while /api/* serves machines and /docs serves the
+        # OpenAPI explorer.
+        @api.get("/", include_in_schema=False)
+        def _root():
+            return RedirectResponse(url="/ui")
+
+        api = gr.mount_gradio_app(api, gradio_app, path="/ui")
+        print(f"[api] UI:   http://{args.host}:{args.port}/ui")
+        print(f"[api] API:  http://{args.host}:{args.port}/api/t2i (see /docs)")
+        uvicorn.run(api, host=args.host, port=args.port, log_level="info")
+    else:
+        gradio_app.launch(
+            server_name=args.host, server_port=args.port, share=args.share,
+            show_error=True, theme=gr.themes.Soft(),
+        )
 
 
 if __name__ == "__main__":
