@@ -103,7 +103,7 @@ python scripts/llada.py download --quant bf16    # 40 GB, needed for fp8 too
 
 | Quant | Source repo | Size | VRAM (load) |
 |---|---|---|---|
-| `nf4` | `SanDiegoDude/LLaDA2.0-Uni-nf4` | ~9 GB | ~9.5 GB |
+| `nf4` | `SanDiegoDude/LLaDA2.0-Uni-bnb-nf4` | ~9 GB | ~9.5 GB |
 | `bf16` | `inclusionAI/LLaDA2.0-Uni` | ~40 GB | ~32 GB |
 | `fp8` | `inclusionAI/LLaDA2.0-Uni` (inline-quantized at load) | ~40 GB | ~17 GB |
 

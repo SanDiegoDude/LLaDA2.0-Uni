@@ -62,9 +62,9 @@ DEFAULT_MODELS_DIR = os.environ.get(
 
 MODEL_SOURCES = {
     # quant -> (huggingface repo_id, subdir under DEFAULT_MODELS_DIR)
-    "nf4":  ("SanDiegoDude/LLaDA2.0-Uni-nf4", "LLaDA2.0-Uni-nf4"),
-    "bf16": ("inclusionAI/LLaDA2.0-Uni",      "LLaDA2.0-Uni"),
-    "fp8":  ("inclusionAI/LLaDA2.0-Uni",      "LLaDA2.0-Uni"),
+    "nf4":  ("SanDiegoDude/LLaDA2.0-Uni-bnb-nf4", "LLaDA2.0-Uni-nf4"),
+    "bf16": ("inclusionAI/LLaDA2.0-Uni",          "LLaDA2.0-Uni"),
+    "fp8":  ("inclusionAI/LLaDA2.0-Uni",          "LLaDA2.0-Uni"),
 }
 
 MODEL_PATHS = {
