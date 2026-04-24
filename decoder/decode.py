@@ -106,9 +106,16 @@ def decode_vq_tokens(token_ids, h, w, model_path, device,
     diff_model = diff_model.to(dtype=dtype).eval()
 
     z = torch.randn([1, 16, 1, 2 * (th // 16), 2 * (tw // 16)], device=device)
+    # NOTE: upstream decode.py sets cfg_scale=0.0 and stochast_ratio=1.0 for
+    # "decoder-turbo", which consistently produces heavy grid-streak artifacts.
+    # Sweeping on the released checkpoint (see outputs/turbo_pure_ode_sweep.png)
+    # showed that the turbo weights themselves are fine — they just need the
+    # SAME sampler config as the normal decoder, only with fewer steps. Using
+    # cfg_scale=1.0 + stochast_ratio=0.0 (pure ODE) makes 8-step turbo produce
+    # clean output matching the 50-step normal decoder.
     model_fn = _create_decoder_model_fn(
         diff_model, cap_pos, cap_neg,
-        cfg_scale=0.0 if decode_mode == "decoder-turbo" else 1.0,
+        cfg_scale=1.0,
         patch_size=cfg.get("all_patch_size", (2,))[0],
         f_patch_size=cfg.get("all_f_patch_size", (1,))[0],
         dtype=dtype)
@@ -117,7 +124,7 @@ def decode_vq_tokens(token_ids, h, w, model_path, device,
     sample_fn = sampler.sample_ode(
         sampling_method="euler", num_steps=num_steps,
         atol=1e-6, rtol=1e-3, reverse=False, time_shifting_factor=6,
-        stochast_ratio=1.0 if decode_mode == "decoder-turbo" else 0.0)
+        stochast_ratio=0.0)
 
     pbar = tqdm(total=num_steps, desc="Decoding", leave=False)
     def wrapped(x, t, **kw):

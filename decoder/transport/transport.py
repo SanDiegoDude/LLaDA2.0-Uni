@@ -441,6 +441,14 @@ class Sampler:
             def _sample(init, model, **model_kwargs):
                 # t0→t1: noise(t=0) → data(t=1)
                 t_steps = th.linspace(t0, t1, num_steps + 1, dtype=th.float64).to(init)
+                # Upstream bug: the ODE branch applies time_shifting_factor via the
+                # ode integrator but the stochastic branch here used uniform steps,
+                # so the distilled turbo decoder (trained with shifted schedule)
+                # produced heavy grid-streak artifacts at 8 steps. Apply the same
+                # reparameterisation here to match the training schedule.
+                if time_shifting_factor:
+                    s = time_shifting_factor
+                    t_steps = t_steps / (t_steps + s - s * t_steps)
                 x_cur = init.to(th.float64)
 
                 for t_cur, t_next in zip(t_steps[:-1], t_steps[1:]):
