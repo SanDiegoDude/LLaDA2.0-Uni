@@ -83,6 +83,10 @@ combo isn't there, pip falls back to a source build (needs `nvcc` on
 - **torchao "cpp extensions skipped" warning** — harmless; FP8 uses
   `torch._scaled_mm` which is in the torch wheel. Only Triton-based
   kernels need the C++ extensions.
+- **Browser tab freezes / crashes when switching Gradio tabs** — you
+  have Gradio 6.11+. A Svelte reactivity loop (gradio#13198) locks up
+  the frontend. We pin to `gradio==6.10.0` in requirements.txt; if
+  you upgrade past that you'll reintroduce the bug.
 
 ## 3. Model weights
 

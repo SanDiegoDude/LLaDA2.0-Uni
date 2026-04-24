@@ -37,4 +37,8 @@ bitsandbytes>=0.49.0
 torchao>=0.14.0,<0.17.0
 huggingface_hub>=0.24.0
 hf_transfer
-gradio>=6.0.0
+# Gradio 6.11+ has a confirmed tab-switching bug that freezes / OOMs the
+# browser via a Svelte reactivity loop (gradio#13198, still open as of
+# 2026-04). 6.10.0 is the last known-good release — stay there until an
+# upstream fix lands.
+gradio==6.10.0
