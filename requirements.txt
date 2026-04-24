@@ -1,11 +1,29 @@
-# Install in two passes so flash-attn can see torch during its build:
-#   pip install -r requirements.txt
-#   pip install --no-build-isolation flash-attn==2.8.3
+# =============================================================================
+# Two-step install (see INSTALL.md for the full story):
 #
-# transformers is hard-pinned because 5.x broke custom `trust_remote_code`
-# loaders (the LLaDA-2.0-Uni modeling file imports APIs removed in 5.x).
+#   1. Install torch FIRST from the PyTorch index that matches your CUDA
+#      driver. Do NOT rely on the PyPI default — it pulls torch 2.11+cu130
+#      which needs a CUDA 13 runtime and also has no prebuilt flash-attn.
+#
+#      Blackwell / DGX (CUDA 13 driver):
+#        pip install torch --index-url https://download.pytorch.org/whl/cu130
+#      RTX 40-series / CUDA 12.8 driver:
+#        pip install torch==2.7.1 torchvision --index-url https://download.pytorch.org/whl/cu128
+#      CUDA 12.4 driver (older):
+#        pip install torch==2.5.1 torchvision --index-url https://download.pytorch.org/whl/cu124
+#
+#   2. Then install the rest:   pip install -r requirements.txt
+#   3. Finally flash-attn:      pip install --no-build-isolation flash-attn==2.8.3
+#
+# transformers is hard-pinned because 5.x broke the custom trust_remote_code
+# loader path used by the LLaDA-2.0-Uni modeling file.
+# =============================================================================
 
-torch>=2.4.0
+# Cap torch below 2.11 because 2.11 only ships cu13 wheels and has no
+# prebuilt flash-attn across the matrix. Step 1 above installs the version
+# we actually want; this line just prevents `pip install -r requirements.txt`
+# from silently upgrading torch on top of it.
+torch>=2.4.0,<2.11
 torchvision>=0.19.0
 transformers==4.57.3
 safetensors>=0.4.0
@@ -17,5 +35,6 @@ accelerate>=0.26.0
 torchdiffeq
 bitsandbytes>=0.49.0
 torchao>=0.14.0,<0.17.0
+huggingface_hub>=0.24.0
 hf_transfer
 gradio>=6.0.0

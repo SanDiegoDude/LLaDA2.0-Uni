@@ -48,14 +48,92 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 
-# Backbone locations — NF4 is self-contained (has aux dirs copied in), bf16 source
-# is used as base for either bf16 inference or inline FP8 quant at load time.
+# Backbone locations + HF sources. NF4 is self-contained (auxiliary dirs are
+# copied into the quantized artifact). bf16 source is also the base for
+# inline-FP8 quantization at load time.
+#
+# Override the root with LLADA_MODELS_DIR, e.g.
+#     export LLADA_MODELS_DIR=/mnt/big/weights
+# Otherwise weights land under ``<repo>/models/`` and auto-download from
+# Hugging Face on first use.
+DEFAULT_MODELS_DIR = os.environ.get(
+    "LLADA_MODELS_DIR", os.path.join(_REPO_ROOT, "models"),
+)
+
+MODEL_SOURCES = {
+    # quant -> (huggingface repo_id, subdir under DEFAULT_MODELS_DIR)
+    "nf4":  ("SanDiegoDude/LLaDA2.0-Uni-nf4", "LLaDA2.0-Uni-nf4"),
+    "bf16": ("inclusionAI/LLaDA2.0-Uni",      "LLaDA2.0-Uni"),
+    "fp8":  ("inclusionAI/LLaDA2.0-Uni",      "LLaDA2.0-Uni"),
+}
+
 MODEL_PATHS = {
-    "nf4": "/home/nathan/shared/models/LLaDA2.0-Uni-nf4",
-    "bf16": "/home/nathan/shared/models/LLaDA2.0-Uni",
-    "fp8": "/home/nathan/shared/models/LLaDA2.0-Uni",  # inline-quanted from bf16
+    q: os.path.join(DEFAULT_MODELS_DIR, subdir)
+    for q, (_, subdir) in MODEL_SOURCES.items()
 }
 DEFAULT_QUANT = "nf4"
+
+
+def _ensure_model_path(
+    quant: str,
+    model_path: str | None = None,
+    *,
+    allow_download: bool = True,
+) -> str:
+    """Return a ready-to-load on-disk path for the given quant.
+
+    Resolution order:
+
+    1. ``model_path`` if the caller provided one → returned as-is (must exist).
+    2. Canonical path ``MODEL_PATHS[quant]`` if it already contains a
+       ``config.json`` → returned.
+    3. Otherwise, if ``allow_download``, pull the matching repo from
+       Hugging Face into that canonical path (with ``hf_transfer`` for
+       speed if available) and return it.
+    4. Else raise ``FileNotFoundError``.
+    """
+    if model_path is not None:
+        if not os.path.exists(os.path.join(model_path, "config.json")):
+            raise FileNotFoundError(
+                f"--model_path {model_path!r} has no config.json; "
+                f"pass a path to a prepared model directory."
+            )
+        return model_path
+
+    target = MODEL_PATHS[quant]
+    if os.path.exists(os.path.join(target, "config.json")):
+        return target
+
+    if not allow_download:
+        raise FileNotFoundError(
+            f"No model found at {target!r}. Re-run with download enabled or "
+            f"set LLADA_MODELS_DIR to wherever your weights live."
+        )
+
+    hf_repo, _ = MODEL_SOURCES[quant]
+    Path(target).mkdir(parents=True, exist_ok=True)
+    # hf_transfer is a massive speedup on fast connections; set the env var
+    # only if the package is present so we don't force a hard dep on it.
+    try:
+        import hf_transfer  # noqa: F401
+
+        os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+    except ImportError:
+        pass
+
+    print(f"[Model] {target!r} empty → downloading '{hf_repo}' from Hugging Face")
+    print(f"        (set LLADA_MODELS_DIR to pick a different cache root)")
+    t0 = time.time()
+    from huggingface_hub import snapshot_download
+
+    snapshot_download(
+        repo_id=hf_repo,
+        local_dir=target,
+        # Skip upstream git artifacts and markdown we don't need at runtime.
+        ignore_patterns=["*.md", ".gitattributes", "README*"],
+    )
+    print(f"[Model] download complete in {time.time() - t0:.1f}s → {target}")
+    return target
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +468,11 @@ def cmd_decode(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 # info
 # ---------------------------------------------------------------------------
+def cmd_download(args: argparse.Namespace) -> None:
+    path = _ensure_model_path(args.quant, args.model_path, allow_download=True)
+    print(f"[download] {args.quant} ready at {path}")
+
+
 def cmd_info(args: argparse.Namespace) -> None:
     p = args.model_path
     print(f"Requested quant: {args.quant}")
@@ -524,16 +607,35 @@ def build_parser() -> argparse.ArgumentParser:
     info = subs.add_parser("info", help="Print detected model variants at --model_path")
     info.add_argument("--quant", choices=["nf4", "fp8", "bf16"], default=DEFAULT_QUANT)
     info.add_argument("--model_path", default=None)
-    info.set_defaults(func=cmd_info)
+    info.set_defaults(func=cmd_info, _allow_download=False)
+
+    # download
+    dl = subs.add_parser(
+        "download",
+        help="Prefetch model weights from Hugging Face for the given --quant",
+    )
+    dl.add_argument("--quant", choices=["nf4", "fp8", "bf16"], default=DEFAULT_QUANT)
+    dl.add_argument("--model_path", default=None,
+                    help="Destination dir; defaults to MODEL_PATHS[quant].")
+    dl.set_defaults(func=cmd_download)
 
     return p
 
 
 def _resolve_model_path(args: argparse.Namespace) -> None:
-    """If --model_path wasn't given, pick the canonical dir for --quant."""
-    if getattr(args, "model_path", None):
-        return
-    args.model_path = MODEL_PATHS[args.quant]
+    """Resolve --model_path for the chosen --quant, downloading if needed."""
+    allow = getattr(args, "_allow_download", True)
+    try:
+        args.model_path = _ensure_model_path(
+            args.quant, getattr(args, "model_path", None),
+            allow_download=allow,
+        )
+    except FileNotFoundError:
+        # ``info`` uses allow=False; fall back to the canonical path so the
+        # command can still report "directory does not exist".
+        args.model_path = (
+            getattr(args, "model_path", None) or MODEL_PATHS[args.quant]
+        )
 
 
 def main() -> None:

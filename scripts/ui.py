@@ -60,6 +60,7 @@ if _REPO_ROOT not in sys.path:
 from scripts.llada import (  # noqa: E402
     MODEL_PATHS,
     _build_fp8_config,
+    _ensure_model_path,
     _image_token_offset,
     _is_quantized,
 )
@@ -730,7 +731,7 @@ def main() -> None:
                          "Adds ~75 s LLM reload between generations.")
     args = ap.parse_args()
 
-    model_path = args.model_path or MODEL_PATHS[args.quant]
+    model_path = _ensure_model_path(args.quant, args.model_path)
     pipe = Pipeline(
         model_path=model_path, quant=args.quant, device=args.device,
         low_vram=args.low_vram,
