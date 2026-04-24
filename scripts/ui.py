@@ -92,6 +92,42 @@ from scripts.llada import (  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
+# LLM monkey-patch: surface generate_bd_image's hidden sampling kwargs
+# ---------------------------------------------------------------------------
+# The upstream `generate_image` and `edit_image` wrappers don't pass
+# `cfg_rescale`, `temperature`, `top_p`, `top_k` through to
+# `generate_bd_image`, so users have no way to tune them. We patch
+# `generate_bd_image` itself to read instance-level overrides set by the
+# Pipeline before each call. setdefault() means the original `generate_image`
+# / `edit_image` callers keep working unchanged — their explicit kwargs (none
+# of these four) win, but our defaults inject when the wrapper is silent.
+def _patch_generate_bd_image(model) -> None:
+    if getattr(model, "_bd_patched", False):
+        return
+    import types
+    original = model.generate_bd_image.__func__  # underlying function
+
+    def patched(self, *args, **kwargs):
+        kwargs.setdefault("cfg_rescale", getattr(self, "_x_cfg_rescale", 0.7))
+        kwargs.setdefault("temperature", getattr(self, "_x_temperature", 0.0))
+        kwargs.setdefault("top_p", getattr(self, "_x_top_p", None))
+        kwargs.setdefault("top_k", getattr(self, "_x_top_k", None))
+        return original(self, *args, **kwargs)
+
+    model.generate_bd_image = types.MethodType(patched, model)
+    model._bd_patched = True
+
+
+def _set_llm_extras(model, *, cfg_rescale: float, temperature: float,
+                    top_p: float | None, top_k: int | None) -> None:
+    """Stage the next-call overrides for the patched generate_bd_image."""
+    model._x_cfg_rescale = cfg_rescale
+    model._x_temperature = temperature
+    model._x_top_p = top_p
+    model._x_top_k = top_k
+
+
+# ---------------------------------------------------------------------------
 # Persistent pipeline
 # ---------------------------------------------------------------------------
 @dataclass
@@ -147,6 +183,7 @@ class Pipeline:
         if self.quant == "bf16" and not _is_quantized(self.model_path):
             m = m.to(torch.bfloat16)
         m.tokenizer = self.tokenizer
+        _patch_generate_bd_image(m)
         self.llm = m
         print(f"[LLM] ready in {time.time() - t0:.1f}s, "
               f"CUDA={torch.cuda.memory_allocated() / 1e9:.2f} GB")
@@ -338,6 +375,9 @@ class Pipeline:
         num_steps: int | None = None,
         resolution_multiplier: int = 2,
         seed: int = 42,
+        decoder_cfg_scale: float = 1.0,
+        time_shifting_factor: float = 6.0,
+        stochast_ratio: float = 0.0,
         progress_cb=None,
     ) -> Image.Image:
         from torchvision.transforms.functional import to_pil_image
@@ -382,8 +422,10 @@ class Pipeline:
         doubled = cap_pos + cap_neg
         patch = cfg.get("all_patch_size", (2,))[0]
         fpatch = cfg.get("all_f_patch_size", (1,))[0]
-        # Our decode.py fix uses cfg=1.0 for both modes (upstream had cfg=0 for turbo).
-        cfg_scale = 1.0
+        # Decoder-side CFG. Defaults to 1.0 (matching our turbo fix); UI/API
+        # can override. 0 disables the negative branch entirely (~halves the
+        # decoder FLOPs but skips guidance).
+        cfg_scale = decoder_cfg_scale
 
         def model_fn(x, t, **_):
             tt = (torch.tensor([t], device=x.device, dtype=torch.float32)
@@ -416,8 +458,9 @@ class Pipeline:
         sampler = Sampler(create_transport("Linear", "velocity", None))
         sample_fn = sampler.sample_ode(
             sampling_method="euler", num_steps=num_steps,
-            atol=1e-6, rtol=1e-3, reverse=False, time_shifting_factor=6,
-            stochast_ratio=0.0,
+            atol=1e-6, rtol=1e-3, reverse=False,
+            time_shifting_factor=time_shifting_factor,
+            stochast_ratio=stochast_ratio,
         )
 
         step_i = [0]
@@ -441,12 +484,25 @@ class Pipeline:
         self, prompt: str, image_h: int, image_w: int, llm_steps: int,
         cfg_scale: float, decoder_mode: str, decoder_steps: int | None,
         resolution_multiplier: int, seed: int, progress_cb=None,
+        *,
+        block_length: int = 32,
+        cfg_rescale: float = 0.7,
+        temperature: float = 0.0,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        decoder_cfg_scale: float = 1.0,
+        time_shifting_factor: float = 6.0,
+        stochast_ratio: float = 0.0,
     ) -> tuple[Image.Image, dict, float, float]:
         # Free the decoder before bringing the LLM up (low_vram / lod).
         if self.low_vram or self.lod:
             self.unload_decoder()
         self.load_llm()
         torch.manual_seed(seed)
+        _set_llm_extras(
+            self.llm, cfg_rescale=cfg_rescale, temperature=temperature,
+            top_p=top_p, top_k=top_k,
+        )
         t0 = time.time()
         if progress_cb:
             progress_cb(0.0, "LLM: generating VQ tokens …")
@@ -463,6 +519,7 @@ class Pipeline:
         res = self.llm.generate_image(
             prompt, image_h=image_h, image_w=image_w,
             steps=llm_steps, cfg_scale=cfg_scale,
+            block_length=block_length,
             gen_length=gen_length,
         )
         t_llm = time.time() - t0
@@ -471,6 +528,11 @@ class Pipeline:
             "task": "t2i", "prompt": prompt, "seed": seed,
             "image_h": image_h, "image_w": image_w,
             "llm_steps": llm_steps, "cfg_scale": cfg_scale,
+            "block_length": block_length, "cfg_rescale": cfg_rescale,
+            "temperature": temperature, "top_p": top_p, "top_k": top_k,
+            "decoder_cfg_scale": decoder_cfg_scale,
+            "time_shifting_factor": time_shifting_factor,
+            "stochast_ratio": stochast_ratio,
             "quant": self.quant, "model_path": self.model_path,
         }
         self.last_vq = {
@@ -484,6 +546,9 @@ class Pipeline:
             res["token_ids"], res["h"], res["w"],
             decoder_mode=decoder_mode, num_steps=decoder_steps,
             resolution_multiplier=resolution_multiplier, seed=seed,
+            decoder_cfg_scale=decoder_cfg_scale,
+            time_shifting_factor=time_shifting_factor,
+            stochast_ratio=stochast_ratio,
             progress_cb=progress_cb,
         )
         t_dec = time.time() - t1
@@ -522,6 +587,14 @@ class Pipeline:
         block_length: int, cfg_text_scale: float, cfg_image_scale: float,
         decoder_mode: str, decoder_steps: int | None,
         resolution_multiplier: int, seed: int, progress_cb=None,
+        *,
+        cfg_rescale: float = 0.7,
+        temperature: float = 0.0,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        decoder_cfg_scale: float = 1.0,
+        time_shifting_factor: float = 6.0,
+        stochast_ratio: float = 0.0,
     ) -> tuple[Image.Image, dict, float, float]:
         from decoder.utils import generate_crop_size_list, var_center_crop
 
@@ -530,6 +603,10 @@ class Pipeline:
         self.load_llm()
         self.load_image_tokenizer()
         torch.manual_seed(seed)
+        _set_llm_extras(
+            self.llm, cfg_rescale=cfg_rescale, temperature=temperature,
+            top_p=top_p, top_k=top_k,
+        )
         offset = _image_token_offset(self.model_path)
 
         if progress_cb:
@@ -556,6 +633,11 @@ class Pipeline:
             "task": "edit", "image": str(image_path), "instruction": instruction,
             "seed": seed, "steps": steps, "block_length": block_length,
             "cfg_text_scale": cfg_text_scale, "cfg_image_scale": cfg_image_scale,
+            "cfg_rescale": cfg_rescale, "temperature": temperature,
+            "top_p": top_p, "top_k": top_k,
+            "decoder_cfg_scale": decoder_cfg_scale,
+            "time_shifting_factor": time_shifting_factor,
+            "stochast_ratio": stochast_ratio,
             "input_size": input_size, "quant": self.quant,
             "model_path": self.model_path,
         }
@@ -570,6 +652,9 @@ class Pipeline:
             res["token_ids"], res["h"], res["w"],
             decoder_mode=decoder_mode, num_steps=decoder_steps,
             resolution_multiplier=resolution_multiplier, seed=seed,
+            decoder_cfg_scale=decoder_cfg_scale,
+            time_shifting_factor=time_shifting_factor,
+            stochast_ratio=stochast_ratio,
             progress_cb=progress_cb,
         )
         t_dec = time.time() - t1
@@ -623,12 +708,53 @@ def build_app(pipe: Pipeline):
                     with gr.Row():
                         t2i_seed = gr.Number(value=42, label="Seed", precision=0)
                     t2i_go = gr.Button("Generate", variant="primary")
+                    with gr.Accordion("Advanced", open=False):
+                        gr.Markdown(
+                            "Defaults preserve current behaviour. Tweak at "
+                            "your own risk — these expose internal sampling "
+                            "knobs that don't all interact gracefully."
+                        )
+                        with gr.Row():
+                            t2i_blk = gr.Slider(
+                                16, 64, 32, step=4,
+                                label="LLM block length",
+                            )
+                            t2i_cfg_rs = gr.Slider(
+                                0.0, 1.0, 0.7, step=0.05,
+                                label="LLM cfg_rescale "
+                                      "(0=sharp/punchy, 0.7=balanced, 1=preserve var)",
+                            )
+                        with gr.Row():
+                            t2i_temp = gr.Slider(
+                                0.0, 2.0, 0.0, step=0.05,
+                                label="LLM temperature (0=greedy)",
+                            )
+                            t2i_top_p = gr.Slider(
+                                0.0, 1.0, 0.0, step=0.05,
+                                label="LLM top_p (0=disabled)",
+                            )
+                        gr.Markdown("**Decoder advanced**")
+                        with gr.Row():
+                            t2i_dec_cfg = gr.Slider(
+                                0.0, 4.0, 1.0, step=0.1,
+                                label="Decoder CFG scale (1=ours, 0=no neg branch)",
+                            )
+                        with gr.Row():
+                            t2i_shift = gr.Slider(
+                                0.0, 10.0, 6.0, step=0.5,
+                                label="Decoder shift (time_shifting_factor)",
+                            )
+                            t2i_stoch = gr.Slider(
+                                0.0, 1.0, 0.0, step=0.05,
+                                label="Decoder stochast_ratio (0=ODE, 1=full re-noise)",
+                            )
                 with gr.Column(scale=3):
                     t2i_img = gr.Image(label="Output", type="pil", height=600,
                                        format="png")
                     t2i_info = gr.Markdown("", elem_classes="status-box")
 
             def run_t2i(prompt, h, w, ls, cfg, mode, ds, seed,
+                        blk, cfg_rs, temp, top_p, dec_cfg, shift, stoch,
                         progress=gr.Progress()):
                 if not prompt.strip():
                     raise gr.Error("Prompt is empty")
@@ -642,6 +768,13 @@ def build_app(pipe: Pipeline):
                     img, meta, t_llm, t_dec = pipe.t2i(
                         prompt, int(h), int(w), int(ls), float(cfg),
                         mode, int(ds), _FIXED_RES_MULT, int(seed), cb,
+                        block_length=int(blk),
+                        cfg_rescale=float(cfg_rs),
+                        temperature=float(temp),
+                        top_p=float(top_p) if float(top_p) > 0 else None,
+                        decoder_cfg_scale=float(dec_cfg),
+                        time_shifting_factor=float(shift),
+                        stochast_ratio=float(stoch),
                     )
                     info = (f"LLM: {t_llm:.1f}s · Decoder: {t_dec:.1f}s · "
                             f"Total: {t_llm + t_dec:.1f}s\n\n"
@@ -661,7 +794,9 @@ def build_app(pipe: Pipeline):
             t2i_go.click(
                 run_t2i,
                 [t2i_prompt, t2i_h, t2i_w, t2i_llm_steps, t2i_cfg,
-                 t2i_mode, t2i_dec_steps, t2i_seed],
+                 t2i_mode, t2i_dec_steps, t2i_seed,
+                 t2i_blk, t2i_cfg_rs, t2i_temp, t2i_top_p,
+                 t2i_dec_cfg, t2i_shift, t2i_stoch],
                 [t2i_img, t2i_info],
             )
             t2i_mode.change(_steps_for_mode, t2i_mode, t2i_dec_steps)
@@ -732,12 +867,41 @@ def build_app(pipe: Pipeline):
                         ed_ds = gr.Slider(2, 50, 8, step=1, label="Decoder steps")
                     ed_seed = gr.Number(value=42, label="Seed", precision=0)
                     ed_go = gr.Button("Edit", variant="primary")
+                    with gr.Accordion("Advanced", open=False):
+                        with gr.Row():
+                            ed_cfg_rs = gr.Slider(
+                                0.0, 1.0, 0.7, step=0.05,
+                                label="LLM cfg_rescale",
+                            )
+                            ed_temp = gr.Slider(
+                                0.0, 2.0, 0.0, step=0.05,
+                                label="LLM temperature",
+                            )
+                            ed_top_p = gr.Slider(
+                                0.0, 1.0, 0.0, step=0.05,
+                                label="LLM top_p (0=off)",
+                            )
+                        gr.Markdown("**Decoder advanced**")
+                        with gr.Row():
+                            ed_dec_cfg = gr.Slider(
+                                0.0, 4.0, 1.0, step=0.1,
+                                label="Decoder CFG scale",
+                            )
+                            ed_shift = gr.Slider(
+                                0.0, 10.0, 6.0, step=0.5,
+                                label="Decoder shift",
+                            )
+                            ed_stoch = gr.Slider(
+                                0.0, 1.0, 0.0, step=0.05,
+                                label="Decoder stochast_ratio",
+                            )
                 with gr.Column(scale=3):
                     ed_out = gr.Image(label="Output", type="pil", height=500,
                                       format="png")
                     ed_info = gr.Markdown("", elem_classes="status-box")
 
             def run_edit(path, instr, isz, stp, blk, ct, ci, mode, ds, seed,
+                         cfg_rs, temp, top_p, dec_cfg, shift, stoch,
                          progress=gr.Progress()):
                 if not path:
                     raise gr.Error("Upload a source image first.")
@@ -754,6 +918,12 @@ def build_app(pipe: Pipeline):
                         path, instr, int(isz), int(stp), int(blk),
                         float(ct), float(ci), mode, int(ds),
                         _FIXED_RES_MULT, int(seed), cb,
+                        cfg_rescale=float(cfg_rs),
+                        temperature=float(temp),
+                        top_p=float(top_p) if float(top_p) > 0 else None,
+                        decoder_cfg_scale=float(dec_cfg),
+                        time_shifting_factor=float(shift),
+                        stochast_ratio=float(stoch),
                     )
                     info = (f"LLM: {t_llm:.1f}s · Decoder: {t_dec:.1f}s · "
                             f"Total: {t_llm + t_dec:.1f}s\n\n"
@@ -771,7 +941,8 @@ def build_app(pipe: Pipeline):
             ed_go.click(
                 run_edit,
                 [ed_img, ed_instr, ed_input, ed_steps, ed_blk, ed_cfg_t, ed_cfg_i,
-                 ed_mode, ed_ds, ed_seed],
+                 ed_mode, ed_ds, ed_seed,
+                 ed_cfg_rs, ed_temp, ed_top_p, ed_dec_cfg, ed_shift, ed_stoch],
                 [ed_out, ed_info],
             )
             ed_mode.change(_steps_for_mode, ed_mode, ed_ds)
@@ -800,12 +971,25 @@ def build_app(pipe: Pipeline):
                                      interactive=False)
                     gr.Markdown("Or upload a saved `.pt` tokens file:")
                     rep_upload = gr.File(label="VQ tokens (.pt)", file_types=[".pt"])
+                    with gr.Accordion("Decoder advanced", open=False):
+                        rep_dec_cfg = gr.Slider(
+                            0.0, 4.0, 1.0, step=0.1,
+                            label="Decoder CFG scale",
+                        )
+                        rep_shift = gr.Slider(
+                            0.0, 10.0, 6.0, step=0.5,
+                            label="Decoder shift",
+                        )
+                        rep_stoch = gr.Slider(
+                            0.0, 1.0, 0.0, step=0.05,
+                            label="Decoder stochast_ratio",
+                        )
                 with gr.Column(scale=3):
                     rep_out = gr.Image(label="Output", type="pil", height=500,
                                        format="png")
                     rep_info = gr.Markdown("", elem_classes="status-box")
 
-            def run_replay(mode, ds, seed, upload,
+            def run_replay(mode, ds, seed, upload, dec_cfg, shift, stoch,
                            progress=gr.Progress()):
                 if upload is not None:
                     payload = torch.load(upload, map_location="cpu",
@@ -832,7 +1016,11 @@ def build_app(pipe: Pipeline):
                     img = pipe.decode(
                         tok_ids, h, w, decoder_mode=mode,
                         num_steps=int(ds), resolution_multiplier=_FIXED_RES_MULT,
-                        seed=int(seed), progress_cb=cb,
+                        seed=int(seed),
+                        decoder_cfg_scale=float(dec_cfg),
+                        time_shifting_factor=float(shift),
+                        stochast_ratio=float(stoch),
+                        progress_cb=cb,
                     )
                     dt = time.time() - t0
                     info = (
@@ -852,7 +1040,8 @@ def build_app(pipe: Pipeline):
 
             rep_go.click(
                 run_replay,
-                [rep_mode, rep_ds, rep_seed, rep_upload],
+                [rep_mode, rep_ds, rep_seed, rep_upload,
+                 rep_dec_cfg, rep_shift, rep_stoch],
                 [rep_out, rep_info],
             )
             rep_mode.change(_steps_for_mode, rep_mode, rep_ds)
@@ -954,6 +1143,15 @@ def build_api(pipe: "Pipeline"):
         decoder_mode: str = Field("turbo", pattern="^(turbo|normal)$")
         decoder_steps: Optional[int] = None
         seed: int = 42
+        # Advanced (all optional, defaults preserve current behaviour)
+        block_length: int = 32
+        cfg_rescale: float = 0.7
+        temperature: float = 0.0
+        top_p: Optional[float] = None
+        top_k: Optional[int] = None
+        decoder_cfg_scale: float = 1.0
+        time_shifting_factor: float = 6.0
+        stochast_ratio: float = 0.0
 
     class EditRequest(BaseModel):
         image_base64: str
@@ -966,6 +1164,14 @@ def build_api(pipe: "Pipeline"):
         decoder_mode: str = Field("turbo", pattern="^(turbo|normal)$")
         decoder_steps: Optional[int] = None
         seed: int = 42
+        # Advanced
+        cfg_rescale: float = 0.7
+        temperature: float = 0.0
+        top_p: Optional[float] = None
+        top_k: Optional[int] = None
+        decoder_cfg_scale: float = 1.0
+        time_shifting_factor: float = 6.0
+        stochast_ratio: float = 0.0
 
     class MMURequest(BaseModel):
         image_base64: str
@@ -1015,6 +1221,14 @@ def build_api(pipe: "Pipeline"):
                 req.prompt, req.image_h, req.image_w, req.llm_steps,
                 req.cfg_scale, req.decoder_mode, req.decoder_steps,
                 _FIXED_RES_MULT, req.seed,
+                block_length=req.block_length,
+                cfg_rescale=req.cfg_rescale,
+                temperature=req.temperature,
+                top_p=req.top_p,
+                top_k=req.top_k,
+                decoder_cfg_scale=req.decoder_cfg_scale,
+                time_shifting_factor=req.time_shifting_factor,
+                stochast_ratio=req.stochast_ratio,
             )
             return {
                 "image_base64": _pil_to_b64(img),
@@ -1038,6 +1252,13 @@ def build_api(pipe: "Pipeline"):
                     req.block_length, req.cfg_text_scale, req.cfg_image_scale,
                     req.decoder_mode, req.decoder_steps,
                     _FIXED_RES_MULT, req.seed,
+                    cfg_rescale=req.cfg_rescale,
+                    temperature=req.temperature,
+                    top_p=req.top_p,
+                    top_k=req.top_k,
+                    decoder_cfg_scale=req.decoder_cfg_scale,
+                    time_shifting_factor=req.time_shifting_factor,
+                    stochast_ratio=req.stochast_ratio,
                 )
             # Strip the tempfile path out of meta — it's dead after the request.
             meta = {k: v for k, v in meta.items() if k != "image"}

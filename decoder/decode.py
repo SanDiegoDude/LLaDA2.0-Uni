@@ -46,7 +46,10 @@ def _create_decoder_model_fn(model, cap_pos, cap_neg, cfg_scale, patch_size, f_p
 @torch.inference_mode()
 def decode_vq_tokens(token_ids, h, w, model_path, device,
                      resolution_multiplier=2, num_steps=50,
-                     decode_mode="normal"):
+                     decode_mode="normal",
+                     decoder_cfg_scale=1.0,
+                     time_shifting_factor=6.0,
+                     stochast_ratio=0.0):
     """
     Decode VQ token IDs into a PIL Image.
 
@@ -59,6 +62,18 @@ def decode_vq_tokens(token_ids, h, w, model_path, device,
         num_steps: ODE sampling steps.
         decode_mode: ``"normal"`` uses the standard decoder (default, 50 steps);
             ``"decoder-turbo"`` uses the distilled decoder (faster, ~8 steps).
+        decoder_cfg_scale: Decoder-side classifier-free guidance scale. 1.0
+            uses the bf16-empty negative prompt as a soft anchor (current
+            default after the turbo fix). >1 extrapolates harder; can sharpen
+            output but may over-saturate. 0.0 disables the negative branch
+            entirely (≈half the FLOPs but skips guidance).
+        time_shifting_factor: ODE time-step warping factor. 6 = upstream
+            default, biases sampling toward early/noisy region (good for
+            distilled turbo). Lower (2–4) spreads steps more uniformly,
+            often crisper detail on 30-step normal decoder.
+        stochast_ratio: 0.0 = pure deterministic ODE (current default).
+            >0 mixes in re-noising per step (SDE-flavoured), trades
+            reproducibility for diversity / sometimes fixes mode collapse.
 
     Returns:
         PIL.Image
@@ -112,10 +127,11 @@ def decode_vq_tokens(token_ids, h, w, model_path, device,
     # showed that the turbo weights themselves are fine — they just need the
     # SAME sampler config as the normal decoder, only with fewer steps. Using
     # cfg_scale=1.0 + stochast_ratio=0.0 (pure ODE) makes 8-step turbo produce
-    # clean output matching the 50-step normal decoder.
+    # clean output matching the 50-step normal decoder. Defaults preserved
+    # here; UI / API can override.
     model_fn = _create_decoder_model_fn(
         diff_model, cap_pos, cap_neg,
-        cfg_scale=1.0,
+        cfg_scale=decoder_cfg_scale,
         patch_size=cfg.get("all_patch_size", (2,))[0],
         f_patch_size=cfg.get("all_f_patch_size", (1,))[0],
         dtype=dtype)
@@ -123,8 +139,9 @@ def decode_vq_tokens(token_ids, h, w, model_path, device,
     sampler = Sampler(create_transport("Linear", "velocity", None))
     sample_fn = sampler.sample_ode(
         sampling_method="euler", num_steps=num_steps,
-        atol=1e-6, rtol=1e-3, reverse=False, time_shifting_factor=6,
-        stochast_ratio=0.0)
+        atol=1e-6, rtol=1e-3, reverse=False,
+        time_shifting_factor=time_shifting_factor,
+        stochast_ratio=stochast_ratio)
 
     pbar = tqdm(total=num_steps, desc="Decoding", leave=False)
     def wrapped(x, t, **kw):
