@@ -67,3 +67,22 @@ test/e2e/v1/*.log
 test/e2e/*.log
 # Exclude build artifacts
 bin/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+.python-version
+
+# Generated outputs and models
+outputs/
+*.pt
+models/
+
+# Scratch / development scripts we don't want to track yet
+scripts/mmu_understand_int8.py
+scripts/mmu_understand_nf4.py
+scripts/mmu_understand_fp8.py
+scripts/mmu_understand_quant.py

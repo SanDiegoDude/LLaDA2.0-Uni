@@ -9,3 +9,7 @@ numpy>=1.24.0
 tqdm>=4.65.0
 accelerate>=0.26.0
 torchdiffeq
+bitsandbytes>=0.49.0
+torchao>=0.14.0,<0.17.0
+hf_transfer
+gradio>=6.0.0
