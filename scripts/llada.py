@@ -40,6 +40,13 @@ from typing import Optional
 import torch
 
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
+
+# The tokenizer ships with the legacy (training-matched) Mistral tekken regex;
+# transformers 4.55+ nags us to set fix_mistral_regex=True, which would break
+# training compatibility. Keep legacy behaviour, silence the noise.
+import warnings  # noqa: E402
+
+warnings.filterwarnings("ignore", message=r".*incorrect regex pattern.*")
 sys.stdout.reconfigure(line_buffering=True)
 
 # Repo root on sys.path so decoder / encoder packages import
@@ -292,12 +299,19 @@ def cmd_t2i(args: argparse.Namespace) -> None:
     print("\n[1/3] LLM text→VQ generation")
     t0 = time.time()
     model = _load_llm(args.model_path, device, args.quant)
+    # Upstream default gen_length=1088 only fits a 32x32 grid (1024 tokens) plus
+    # header. Anything bigger silently truncates the VQ token stream and breaks
+    # the decoder reshape. Auto-size from the requested dims.
+    grid_h = (args.image_h // 2) // 16
+    grid_w = (args.image_w // 2) // 16
+    gen_length = max(1088, grid_h * grid_w + 64)
     res = model.generate_image(
         args.prompt,
         image_h=args.image_h,
         image_w=args.image_w,
         steps=args.llm_steps,
         cfg_scale=args.cfg_scale,
+        gen_length=gen_length,
     )
     print(f"  [LLM] generated {len(res['token_ids'])} VQ tokens in {time.time() - t0:.1f}s")
     _unload(model)

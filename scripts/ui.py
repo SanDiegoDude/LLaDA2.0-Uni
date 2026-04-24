@@ -52,6 +52,14 @@ from PIL import Image
 
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
+# The LLaDA-2 tokenizer ships with the legacy (training-matched) Mistral
+# tekken regex. transformers 4.55+ prints a loud warning suggesting we set
+# fix_mistral_regex=True, but doing so would mismatch training — keep the
+# legacy behaviour and mute the warning.
+import warnings  # noqa: E402
+
+warnings.filterwarnings("ignore", message=r".*incorrect regex pattern.*")
+
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
@@ -340,9 +348,20 @@ class Pipeline:
         t0 = time.time()
         if progress_cb:
             progress_cb(0.0, "LLM: generating VQ tokens …")
+        # generate_image's default gen_length=1088 only fits a 32x32 (=1024 tokens)
+        # grid plus a small header. Anything bigger silently truncates the
+        # returned token_ids, which then fails the .view(1, 1, h, w) reshape in
+        # the decoder. Auto-size from the requested dims (model halves them
+        # internally, then /16 to get the token grid) and add a small header
+        # safety margin.
+        grid_h = (image_h // 2) // 16
+        grid_w = (image_w // 2) // 16
+        needed = grid_h * grid_w + 64
+        gen_length = max(1088, needed)
         res = self.llm.generate_image(
             prompt, image_h=image_h, image_w=image_w,
             steps=llm_steps, cfg_scale=cfg_scale,
+            gen_length=gen_length,
         )
         t_llm = time.time() - t0
 
