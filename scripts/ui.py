@@ -490,6 +490,7 @@ class Pipeline:
         temperature: float = 0.0,
         top_p: float | None = None,
         top_k: int | None = None,
+        use_sprint: bool = False,
         decoder_cfg_scale: float = 1.0,
         time_shifting_factor: float = 6.0,
         stochast_ratio: float = 0.0,
@@ -521,6 +522,7 @@ class Pipeline:
             steps=llm_steps, cfg_scale=cfg_scale,
             block_length=block_length,
             gen_length=gen_length,
+            use_sprint=use_sprint,
         )
         t_llm = time.time() - t0
 
@@ -530,6 +532,7 @@ class Pipeline:
             "llm_steps": llm_steps, "cfg_scale": cfg_scale,
             "block_length": block_length, "cfg_rescale": cfg_rescale,
             "temperature": temperature, "top_p": top_p, "top_k": top_k,
+            "use_sprint": use_sprint,
             "decoder_cfg_scale": decoder_cfg_scale,
             "time_shifting_factor": time_shifting_factor,
             "stochast_ratio": stochast_ratio,
@@ -592,6 +595,7 @@ class Pipeline:
         temperature: float = 0.0,
         top_p: float | None = None,
         top_k: int | None = None,
+        use_sprint: bool = False,
         decoder_cfg_scale: float = 1.0,
         time_shifting_factor: float = 6.0,
         stochast_ratio: float = 0.0,
@@ -626,6 +630,7 @@ class Pipeline:
             ids, h, w, instruction,
             steps=steps, block_length=block_length,
             cfg_text_scale=cfg_text_scale, cfg_image_scale=cfg_image_scale,
+            use_sprint=use_sprint,
         )
         t_llm = time.time() - t0
 
@@ -634,7 +639,7 @@ class Pipeline:
             "seed": seed, "steps": steps, "block_length": block_length,
             "cfg_text_scale": cfg_text_scale, "cfg_image_scale": cfg_image_scale,
             "cfg_rescale": cfg_rescale, "temperature": temperature,
-            "top_p": top_p, "top_k": top_k,
+            "top_p": top_p, "top_k": top_k, "use_sprint": use_sprint,
             "decoder_cfg_scale": decoder_cfg_scale,
             "time_shifting_factor": time_shifting_factor,
             "stochast_ratio": stochast_ratio,
@@ -716,7 +721,7 @@ def build_app(pipe: Pipeline):
                         )
                         with gr.Row():
                             t2i_blk = gr.Slider(
-                                16, 64, 32, step=4,
+                                16, 256, 32, step=4,
                                 label="LLM block length",
                             )
                             t2i_cfg_rs = gr.Slider(
@@ -733,6 +738,11 @@ def build_app(pipe: Pipeline):
                                 0.0, 1.0, 0.0, step=0.05,
                                 label="LLM top_p (0=disabled)",
                             )
+                        t2i_sprint = gr.Checkbox(
+                            value=False,
+                            label="use_sprint (KV-cache prune accel; "
+                                  "ignored in editing CFG mode)",
+                        )
                         gr.Markdown("**Decoder advanced**")
                         with gr.Row():
                             t2i_dec_cfg = gr.Slider(
@@ -754,7 +764,8 @@ def build_app(pipe: Pipeline):
                     t2i_info = gr.Markdown("", elem_classes="status-box")
 
             def run_t2i(prompt, h, w, ls, cfg, mode, ds, seed,
-                        blk, cfg_rs, temp, top_p, dec_cfg, shift, stoch,
+                        blk, cfg_rs, temp, top_p, sprint,
+                        dec_cfg, shift, stoch,
                         progress=gr.Progress()):
                 if not prompt.strip():
                     raise gr.Error("Prompt is empty")
@@ -772,6 +783,7 @@ def build_app(pipe: Pipeline):
                         cfg_rescale=float(cfg_rs),
                         temperature=float(temp),
                         top_p=float(top_p) if float(top_p) > 0 else None,
+                        use_sprint=bool(sprint),
                         decoder_cfg_scale=float(dec_cfg),
                         time_shifting_factor=float(shift),
                         stochast_ratio=float(stoch),
@@ -795,7 +807,7 @@ def build_app(pipe: Pipeline):
                 run_t2i,
                 [t2i_prompt, t2i_h, t2i_w, t2i_llm_steps, t2i_cfg,
                  t2i_mode, t2i_dec_steps, t2i_seed,
-                 t2i_blk, t2i_cfg_rs, t2i_temp, t2i_top_p,
+                 t2i_blk, t2i_cfg_rs, t2i_temp, t2i_top_p, t2i_sprint,
                  t2i_dec_cfg, t2i_shift, t2i_stoch],
                 [t2i_img, t2i_info],
             )
@@ -853,7 +865,7 @@ def build_app(pipe: Pipeline):
                         ed_input = gr.Slider(512, 1536, 1024, step=128,
                                              label="Input size (px)")
                         ed_steps = gr.Slider(1, 32, 8, step=1, label="LLM steps")
-                        ed_blk = gr.Slider(16, 64, 32, step=4, label="Block length")
+                        ed_blk = gr.Slider(16, 256, 32, step=4, label="Block length")
                     with gr.Row():
                         # Text CFG min 1.0: 0 means "ignore the prompt", which
                         # makes the whole call pointless. Image CFG can stay 0
@@ -881,6 +893,11 @@ def build_app(pipe: Pipeline):
                                 0.0, 1.0, 0.0, step=0.05,
                                 label="LLM top_p (0=off)",
                             )
+                        ed_sprint = gr.Checkbox(
+                            value=False,
+                            label="use_sprint (auto-falls-back to baseline "
+                                  "when CFG image > 0)",
+                        )
                         gr.Markdown("**Decoder advanced**")
                         with gr.Row():
                             ed_dec_cfg = gr.Slider(
@@ -901,7 +918,7 @@ def build_app(pipe: Pipeline):
                     ed_info = gr.Markdown("", elem_classes="status-box")
 
             def run_edit(path, instr, isz, stp, blk, ct, ci, mode, ds, seed,
-                         cfg_rs, temp, top_p, dec_cfg, shift, stoch,
+                         cfg_rs, temp, top_p, sprint, dec_cfg, shift, stoch,
                          progress=gr.Progress()):
                 if not path:
                     raise gr.Error("Upload a source image first.")
@@ -921,6 +938,7 @@ def build_app(pipe: Pipeline):
                         cfg_rescale=float(cfg_rs),
                         temperature=float(temp),
                         top_p=float(top_p) if float(top_p) > 0 else None,
+                        use_sprint=bool(sprint),
                         decoder_cfg_scale=float(dec_cfg),
                         time_shifting_factor=float(shift),
                         stochast_ratio=float(stoch),
@@ -942,7 +960,8 @@ def build_app(pipe: Pipeline):
                 run_edit,
                 [ed_img, ed_instr, ed_input, ed_steps, ed_blk, ed_cfg_t, ed_cfg_i,
                  ed_mode, ed_ds, ed_seed,
-                 ed_cfg_rs, ed_temp, ed_top_p, ed_dec_cfg, ed_shift, ed_stoch],
+                 ed_cfg_rs, ed_temp, ed_top_p, ed_sprint,
+                 ed_dec_cfg, ed_shift, ed_stoch],
                 [ed_out, ed_info],
             )
             ed_mode.change(_steps_for_mode, ed_mode, ed_ds)
@@ -1149,6 +1168,7 @@ def build_api(pipe: "Pipeline"):
         temperature: float = 0.0
         top_p: Optional[float] = None
         top_k: Optional[int] = None
+        use_sprint: bool = False
         decoder_cfg_scale: float = 1.0
         time_shifting_factor: float = 6.0
         stochast_ratio: float = 0.0
@@ -1169,6 +1189,7 @@ def build_api(pipe: "Pipeline"):
         temperature: float = 0.0
         top_p: Optional[float] = None
         top_k: Optional[int] = None
+        use_sprint: bool = False
         decoder_cfg_scale: float = 1.0
         time_shifting_factor: float = 6.0
         stochast_ratio: float = 0.0
@@ -1226,6 +1247,7 @@ def build_api(pipe: "Pipeline"):
                 temperature=req.temperature,
                 top_p=req.top_p,
                 top_k=req.top_k,
+                use_sprint=req.use_sprint,
                 decoder_cfg_scale=req.decoder_cfg_scale,
                 time_shifting_factor=req.time_shifting_factor,
                 stochast_ratio=req.stochast_ratio,
@@ -1256,6 +1278,7 @@ def build_api(pipe: "Pipeline"):
                     temperature=req.temperature,
                     top_p=req.top_p,
                     top_k=req.top_k,
+                    use_sprint=req.use_sprint,
                     decoder_cfg_scale=req.decoder_cfg_scale,
                     time_shifting_factor=req.time_shifting_factor,
                     stochast_ratio=req.stochast_ratio,
