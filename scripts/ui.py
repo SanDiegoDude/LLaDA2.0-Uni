@@ -68,6 +68,15 @@ warnings.filterwarnings("ignore", message=r".*incorrect regex pattern.*")
 # or outright artifacts. Keeping the dial exposed to users was a footgun.
 _FIXED_RES_MULT = 2
 
+# Per-mode decoder step defaults. Turbo is distilled to 8 steps and breaks
+# below that. Normal converges cleanly at 30 (upstream uses 50 but 30 is
+# visually indistinguishable in our testing at ~40% less wall time).
+_DEFAULT_DECODER_STEPS = {"turbo": 8, "normal": 30}
+
+
+def _steps_for_mode(mode: str) -> int:
+    return _DEFAULT_DECODER_STEPS.get(mode, 8)
+
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
@@ -160,13 +169,28 @@ class Pipeline:
         print(f"[SigVQ] ready in {time.time() - t0:.1f}s")
 
     def load_decoder(self, mode: str) -> None:
-        """mode ∈ {"turbo", "normal"}. Caches both architecture cfg + weights."""
+        """mode ∈ {"turbo", "normal"}. Only one decoder is kept resident.
+
+        Each decoder weight file is ~12.3 GB; holding both turbo and normal
+        on a 24 GB card guarantees OOM the moment anything else touches
+        VRAM. Having two copies also offers no value — the user picks one
+        per generation. So: loading a new mode evicts the other first.
+        """
         from safetensors.torch import load_file
 
         from decoder.decoder_model import ZImageTransformer2DModel
 
         if mode in self.decoder_models:
             return
+        # Evict any other decoder modes before we allocate the new one.
+        other_modes = [m for m in self.decoder_models if m != mode]
+        for m in other_modes:
+            print(f"[Decoder:{m}] evicting (switching to {mode!r})")
+            del self.decoder_models[m]
+            self.decoder_cfgs.pop(m, None)
+        if other_modes:
+            gc.collect()
+            torch.cuda.empty_cache()
         sub = "decoder-turbo" if mode == "turbo" else "decoder"
         print(f"[Decoder:{mode}] loading {sub}/")
         t0 = time.time()
@@ -268,12 +292,34 @@ class Pipeline:
         self.unload_sigvq()
         self.unload_vae()
 
-    def finalize_request(self) -> None:
+    def finalize_request(self, error: BaseException | None = None) -> None:
         """Run at the end of every UI / API request (in a finally block).
 
-        Currently a no-op unless ``--lod`` is on, in which case it flushes
-        every weight back out of GPU memory so the process idles near 0 GB.
+        On a clean completion:
+          - no-op in the default cached mode
+          - unload everything in ``--lod`` mode
+
+        On ANY exception (OOM or otherwise), unload everything regardless
+        of mode. This is important for recovery: a partially-completed
+        load, a CUDA OOM mid-decode, or a decoder swap that failed part-way
+        can leave the pipeline in a half-loaded state that will reliably
+        re-OOM on the next request. Tearing it all down and letting the
+        next request cold-start is the robust path.
         """
+        if error is not None:
+            is_oom = (
+                isinstance(error, torch.cuda.OutOfMemoryError)
+                or "out of memory" in str(error).lower()
+            )
+            tag = "oom" if is_oom else "error"
+            print(f"[{tag}] {type(error).__name__}: {error}")
+            print(f"[{tag}] unloading all components to recover — next "
+                  f"request will cold-start")
+            t0 = time.time()
+            self.unload_all()
+            print(f"[{tag}] recovered in {time.time() - t0:.1f}s, "
+                  f"CUDA={torch.cuda.memory_allocated() / 1e9:.2f} GB")
+            return
         if self.lod:
             print("[lod] request finished, unloading everything")
             t0 = time.time()
@@ -314,7 +360,10 @@ class Pipeline:
         diff_model = self.decoder_models[decoder_mode]
         cfg = self.decoder_cfgs[decoder_mode]
         if num_steps is None:
-            num_steps = 8 if decoder_mode == "turbo" else 50
+            # 8 is the distilled value for turbo; 30 is the empirically-tuned
+            # sweet spot for normal — upstream defaults to 50 but 30 is
+            # visually indistinguishable at ~40% less decode time.
+            num_steps = 8 if decoder_mode == "turbo" else 30
 
         # Stage 1: SigVQ → semantic features
         th = h * 16 * resolution_multiplier
@@ -586,6 +635,7 @@ def build_app(pipe: Pipeline):
                 def cb(frac, msg):
                     progress(frac, desc=msg)
 
+                err = None
                 try:
                     progress(0.0, desc="LLM warming up …")
                     img, meta, t_llm, t_dec = pipe.t2i(
@@ -598,8 +648,14 @@ def build_app(pipe: Pipeline):
                             f"{(meta['image_h'] // 32) * (meta['image_w'] // 32)} "
                             f"· CUDA: {torch.cuda.memory_allocated() / 1e9:.1f} GB")
                     return img, info
+                except Exception as e:
+                    err = e
+                    raise gr.Error(
+                        f"{type(e).__name__}: {e}\n\n"
+                        "GPU state has been reset — you can try again without restarting."
+                    ) from e
                 finally:
-                    pipe.finalize_request()
+                    pipe.finalize_request(err)
 
             t2i_go.click(
                 run_t2i,
@@ -607,6 +663,7 @@ def build_app(pipe: Pipeline):
                  t2i_mode, t2i_dec_steps, t2i_seed],
                 [t2i_img, t2i_info],
             )
+            t2i_mode.change(_steps_for_mode, t2i_mode, t2i_dec_steps)
 
         # ---- MMU ----
         with gr.Tab("Understand"):
@@ -630,11 +687,18 @@ def build_app(pipe: Pipeline):
             def run_mmu(path, q, s, bl, gl, seed):
                 if not path:
                     raise gr.Error("Upload an image first.")
+                err = None
                 try:
                     ans, t = pipe.mmu(path, q, int(s), int(bl), int(gl), int(seed))
                     return ans, f"LLM: {t:.1f}s"
+                except Exception as e:
+                    err = e
+                    raise gr.Error(
+                        f"{type(e).__name__}: {e}\n\n"
+                        "GPU state has been reset — you can try again without restarting."
+                    ) from e
                 finally:
-                    pipe.finalize_request()
+                    pipe.finalize_request(err)
 
             mmu_go.click(run_mmu,
                          [mmu_img, mmu_q, mmu_steps, mmu_blk, mmu_len, mmu_seed],
@@ -677,6 +741,7 @@ def build_app(pipe: Pipeline):
                 def cb(frac, msg):
                     progress(frac, desc=msg)
 
+                err = None
                 try:
                     progress(0.0, desc="Tokenizing …")
                     img, meta, t_llm, t_dec = pipe.edit(
@@ -688,8 +753,14 @@ def build_app(pipe: Pipeline):
                             f"Total: {t_llm + t_dec:.1f}s\n\n"
                             f"CUDA: {torch.cuda.memory_allocated() / 1e9:.1f} GB")
                     return img, info
+                except Exception as e:
+                    err = e
+                    raise gr.Error(
+                        f"{type(e).__name__}: {e}\n\n"
+                        "GPU state has been reset — you can try again without restarting."
+                    ) from e
                 finally:
-                    pipe.finalize_request()
+                    pipe.finalize_request(err)
 
             ed_go.click(
                 run_edit,
@@ -697,6 +768,7 @@ def build_app(pipe: Pipeline):
                  ed_mode, ed_ds, ed_seed],
                 [ed_out, ed_info],
             )
+            ed_mode.change(_steps_for_mode, ed_mode, ed_ds)
 
         # ---- Replay decoder ----
         with gr.Tab("Replay decoder"):
@@ -739,6 +811,7 @@ def build_app(pipe: Pipeline):
                 def cb(frac, msg):
                     progress(frac, desc=msg)
 
+                err = None
                 try:
                     t0 = time.time()
                     img = pipe.decode(
@@ -753,14 +826,21 @@ def build_app(pipe: Pipeline):
                         f"'{(meta.get('prompt') or meta.get('instruction') or '')[:80]}'"
                     )
                     return img, info
+                except Exception as e:
+                    err = e
+                    raise gr.Error(
+                        f"{type(e).__name__}: {e}\n\n"
+                        "GPU state has been reset — you can try again without restarting."
+                    ) from e
                 finally:
-                    pipe.finalize_request()
+                    pipe.finalize_request(err)
 
             rep_go.click(
                 run_replay,
                 [rep_mode, rep_ds, rep_seed, rep_upload],
                 [rep_out, rep_info],
             )
+            rep_mode.change(_steps_for_mode, rep_mode, rep_ds)
 
         # ---- Status / Info ----
         with gr.Tab("Status"):
@@ -899,25 +979,28 @@ def build_api(pipe: "Pipeline"):
 
     @api.post("/api/t2i")
     def t2i(req: T2IRequest):
+        err = None
         try:
             img, meta, t_llm, t_dec = pipe.t2i(
                 req.prompt, req.image_h, req.image_w, req.llm_steps,
                 req.cfg_scale, req.decoder_mode, req.decoder_steps,
                 _FIXED_RES_MULT, req.seed,
             )
+            return {
+                "image_base64": _pil_to_b64(img),
+                "format": "png",
+                "meta": meta,
+                "timing": {"t_llm": t_llm, "t_dec": t_dec, "total": t_llm + t_dec},
+            }
         except Exception as e:
-            pipe.finalize_request()
-            raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
-        pipe.finalize_request()
-        return {
-            "image_base64": _pil_to_b64(img),
-            "format": "png",
-            "meta": meta,
-            "timing": {"t_llm": t_llm, "t_dec": t_dec, "total": t_llm + t_dec},
-        }
+            err = e
+            raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}") from e
+        finally:
+            pipe.finalize_request(err)
 
     @api.post("/api/edit")
     def edit(req: EditRequest):
+        err = None
         try:
             with _b64_to_tempfile(req.image_base64) as path:
                 img, meta, t_llm, t_dec = pipe.edit(
@@ -926,35 +1009,38 @@ def build_api(pipe: "Pipeline"):
                     req.decoder_mode, req.decoder_steps,
                     _FIXED_RES_MULT, req.seed,
                 )
+            # Strip the tempfile path out of meta — it's dead after the request.
+            meta = {k: v for k, v in meta.items() if k != "image"}
+            return {
+                "image_base64": _pil_to_b64(img),
+                "format": "png",
+                "meta": meta,
+                "timing": {"t_llm": t_llm, "t_dec": t_dec, "total": t_llm + t_dec},
+            }
         except Exception as e:
-            pipe.finalize_request()
-            raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
-        pipe.finalize_request()
-        # Strip the tempfile path out of meta — it's dead after the request.
-        meta = {k: v for k, v in meta.items() if k != "image"}
-        return {
-            "image_base64": _pil_to_b64(img),
-            "format": "png",
-            "meta": meta,
-            "timing": {"t_llm": t_llm, "t_dec": t_dec, "total": t_llm + t_dec},
-        }
+            err = e
+            raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}") from e
+        finally:
+            pipe.finalize_request(err)
 
     @api.post("/api/mmu")
     def mmu(req: MMURequest):
+        err = None
         try:
             with _b64_to_tempfile(req.image_base64) as path:
                 answer, t_llm = pipe.mmu(
                     path, req.question, req.llm_steps, req.block_length,
                     req.gen_length, req.seed,
                 )
+            return {
+                "answer": answer,
+                "timing": {"t_llm": t_llm, "total": t_llm},
+            }
         except Exception as e:
-            pipe.finalize_request()
-            raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
-        pipe.finalize_request()
-        return {
-            "answer": answer,
-            "timing": {"t_llm": t_llm, "total": t_llm},
-        }
+            err = e
+            raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}") from e
+        finally:
+            pipe.finalize_request(err)
 
     return api
 
