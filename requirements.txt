@@ -1,9 +1,15 @@
+# Install in two passes so flash-attn can see torch during its build:
+#   pip install -r requirements.txt
+#   pip install --no-build-isolation flash-attn==2.8.3
+#
+# transformers is hard-pinned because 5.x broke custom `trust_remote_code`
+# loaders (the LLaDA-2.0-Uni modeling file imports APIs removed in 5.x).
+
 torch>=2.4.0
 torchvision>=0.19.0
-transformers>=4.45.0
+transformers==4.57.3
 safetensors>=0.4.0
 diffusers>=0.30.0
-flash-attn>=2.5.0
 Pillow>=10.0.0
 numpy>=1.24.0
 tqdm>=4.65.0
