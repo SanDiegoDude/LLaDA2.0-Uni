@@ -212,8 +212,21 @@ curl -X POST http://localhost:7860/api/t2i \
   full reload cost. Implied by `--lod`.
 - `--share` — expose a public `gradio.live` URL (UI-only, no effect
   when `--api` is set — use a reverse proxy for public API access).
-- `--quant {nf4,fp8,bf16}` — swap backbone precision. Weights for the
-  requested quant auto-download on first use.
+- `--quant {nf4,fp8,bf16}` — global backbone precision applied to both
+  LLM and decoder. Weights for the requested quant auto-download on
+  first use.
+- `--llm-quant {nf4,fp8,bf16}` / `--decoder-quant {nf4,fp8,bf16}` —
+  override per-component. Whatever you don't specify falls back to
+  `--quant`. Mix-and-match example:
+
+  ```bash
+  python scripts/ui.py --llm-quant fp8 --decoder-quant nf4 --low_vram
+  ```
+
+  Note: the released NF4 and bf16 model dirs ship _identical_ bf16
+  decoder weights, so today this is mostly forward-compatible plumbing
+  and only affects which dir the decoder safetensors load from. The
+  knob is wired so a future quantized decoder slots in cleanly.
 
 ## 5. What's different from upstream
 

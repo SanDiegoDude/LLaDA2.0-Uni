@@ -141,6 +141,14 @@ class Pipeline:
     model_path: str
     quant: str
     device: str = "cuda"
+    # Optional independent source for the decoder + sigvq + vae weights. If
+    # None (default), inherits from model_path / quant. The current released
+    # NF4 and bf16 model dirs ship the SAME bf16 decoder weights, so picking
+    # a different decoder_quant here is mostly plumbing for future quantized
+    # decoders — but having the knob lets you mix-and-match LLM and decoder
+    # paths today (e.g. test FP8 LLM against the canonical bf16 decoder).
+    decoder_path: str | None = None
+    decoder_quant: str | None = None
     # When True, swap LLM ↔ decoder on GPU so the two never co-reside.
     # Target use: 24 GB consumer cards (4090, 3090) where LLM(9.5) + decoder(12.3)
     # would otherwise clip. Pays ~75 s LLM reload between every generation, but
@@ -160,6 +168,13 @@ class Pipeline:
     decoder_models: dict[str, object] = field(default_factory=dict)  # mode -> diff_model
     decoder_cfgs: dict[str, dict] = field(default_factory=dict)      # mode -> cfg.json
     last_vq: dict | None = None  # cache of last generated/edited VQ tokens
+
+    def __post_init__(self) -> None:
+        # Decoder side defaults to the LLM side unless explicitly overridden.
+        if self.decoder_path is None:
+            self.decoder_path = self.model_path
+        if self.decoder_quant is None:
+            self.decoder_quant = self.quant
 
     # --- load helpers ---
     def load_llm(self) -> None:
@@ -199,7 +214,7 @@ class Pipeline:
             self.device, dtype=torch.bfloat16,
         )
         m.load_state_dict(torch.load(
-            os.path.join(self.model_path, "image_tokenizer", "sigvq_embedding.pt"),
+            os.path.join(self.decoder_path, "image_tokenizer", "sigvq_embedding.pt"),
             map_location=self.device, weights_only=True,
         ))
         self.sigvq = m.eval()
@@ -229,14 +244,14 @@ class Pipeline:
             gc.collect()
             torch.cuda.empty_cache()
         sub = "decoder-turbo" if mode == "turbo" else "decoder"
-        print(f"[Decoder:{mode}] loading {sub}/")
+        print(f"[Decoder:{mode}] loading {sub}/ from {self.decoder_path}")
         t0 = time.time()
-        cfg = json.load(open(os.path.join(self.model_path, sub, "config.json")))
+        cfg = json.load(open(os.path.join(self.decoder_path, sub, "config.json")))
         cfg["axes_lens"] = [32768, 1024, 1024]
         cfg["cap_feat_dim"] = 4096
         with torch.device("meta"):
             m = ZImageTransformer2DModel(**cfg)
-        ckpt = os.path.join(self.model_path, sub, "decoder_model.safetensors")
+        ckpt = os.path.join(self.decoder_path, sub, "decoder_model.safetensors")
         m.load_state_dict(
             load_file(ckpt, device=str(self.device)), assign=True,
         )
@@ -253,7 +268,7 @@ class Pipeline:
         print("[VAE] loading")
         t0 = time.time()
         self.vae = AutoencoderKL.from_pretrained(
-            os.path.join(self.model_path, "vae"), torch_dtype=torch.bfloat16,
+            os.path.join(self.decoder_path, "vae"), torch_dtype=torch.bfloat16,
         ).to(self.device).eval()
         print(f"[VAE] ready in {time.time() - t0:.1f}s")
 
@@ -537,6 +552,8 @@ class Pipeline:
             "time_shifting_factor": time_shifting_factor,
             "stochast_ratio": stochast_ratio,
             "quant": self.quant, "model_path": self.model_path,
+            "decoder_quant": self.decoder_quant,
+            "decoder_path": self.decoder_path,
         }
         self.last_vq = {
             "token_ids": res["token_ids"], "h": res["h"], "w": res["w"], "meta": meta,
@@ -645,6 +662,8 @@ class Pipeline:
             "stochast_ratio": stochast_ratio,
             "input_size": input_size, "quant": self.quant,
             "model_path": self.model_path,
+            "decoder_quant": self.decoder_quant,
+            "decoder_path": self.decoder_path,
         }
         self.last_vq = {
             "token_ids": res["token_ids"], "h": res["h"], "w": res["w"], "meta": meta,
@@ -673,11 +692,18 @@ def build_app(pipe: Pipeline):
     import gradio as gr
 
     with gr.Blocks(title="LLaDA-2.0-Uni") as app:
-        header = (
-            f"# LLaDA-2.0-Uni · Unified dLLM\n"
-            f"Backbone: **{pipe.quant}** · Path: `{pipe.model_path}` · "
-            f"Device: **{pipe.device}**"
-        )
+        if pipe.decoder_path == pipe.model_path:
+            backbone_line = (
+                f"Backbone: **{pipe.quant}** · Path: `{pipe.model_path}` · "
+                f"Device: **{pipe.device}**"
+            )
+        else:
+            backbone_line = (
+                f"LLM: **{pipe.quant}** (`{pipe.model_path}`) · "
+                f"Decoder: **{pipe.decoder_quant}** (`{pipe.decoder_path}`) · "
+                f"Device: **{pipe.device}**"
+            )
+        header = f"# LLaDA-2.0-Uni · Unified dLLM\n{backbone_line}"
         if pipe.low_vram:
             header += (
                 "\n\n*Running in `--low_vram` mode: LLM and decoder swap on and "
@@ -721,7 +747,7 @@ def build_app(pipe: Pipeline):
                         )
                         with gr.Row():
                             t2i_blk = gr.Slider(
-                                16, 256, 32, step=4,
+                                16, 128, 32, step=4,
                                 label="LLM block length",
                             )
                             t2i_cfg_rs = gr.Slider(
@@ -865,7 +891,7 @@ def build_app(pipe: Pipeline):
                         ed_input = gr.Slider(512, 1536, 1024, step=128,
                                              label="Input size (px)")
                         ed_steps = gr.Slider(1, 32, 8, step=1, label="LLM steps")
-                        ed_blk = gr.Slider(16, 256, 32, step=4, label="Block length")
+                        ed_blk = gr.Slider(16, 128, 32, step=4, label="Block length")
                     with gr.Row():
                         # Text CFG min 1.0: 0 means "ignore the prompt", which
                         # makes the whole call pointless. Image CFG can stay 0
@@ -1086,8 +1112,10 @@ def build_app(pipe: Pipeline):
 
             def refresh():
                 lines = [
-                    f"**Quant:** `{pipe.quant}`",
-                    f"**Model path:** `{pipe.model_path}`",
+                    f"**LLM quant:** `{pipe.quant}`",
+                    f"**LLM path:** `{pipe.model_path}`",
+                    f"**Decoder quant:** `{pipe.decoder_quant}`",
+                    f"**Decoder path:** `{pipe.decoder_path}`",
                     f"**CUDA mem:** {torch.cuda.memory_allocated() / 1e9:.2f} GB",
                     f"**low_vram:** {'on (swapping enabled)' if pipe.low_vram else 'off'}",
                     f"**lod:** {'on (cold-start every request)' if pipe.lod else 'off'}",
@@ -1216,8 +1244,12 @@ def build_api(pipe: "Pipeline"):
     @api.get("/api/status")
     def status():
         return {
-            "quant": pipe.quant,
-            "model_path": pipe.model_path,
+            "quant": pipe.quant,            # legacy alias for llm_quant
+            "model_path": pipe.model_path,  # legacy alias for llm_path
+            "llm_quant": pipe.quant,
+            "llm_path": pipe.model_path,
+            "decoder_quant": pipe.decoder_quant,
+            "decoder_path": pipe.decoder_path,
             "device": pipe.device,
             "low_vram": pipe.low_vram,
             "lod": pipe.lod,
@@ -1325,9 +1357,24 @@ def build_api(pipe: "Pipeline"):
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--quant", choices=["nf4", "fp8", "bf16"], default="nf4",
-                    help="Backbone precision (default: nf4 — 9.5 GB VRAM)")
+                    help="Global backbone precision applied to BOTH the LLM "
+                         "and the decoder side unless overridden by "
+                         "--llm-quant / --decoder-quant. Default: nf4.")
+    ap.add_argument("--llm-quant", choices=["nf4", "fp8", "bf16"], default=None,
+                    help="LLM precision override (falls back to --quant). "
+                         "Use this to mix-and-match — e.g. --llm-quant fp8 "
+                         "--decoder-quant nf4 to test FP8 LLM with the NF4 "
+                         "model dir's decoder weights (which are bf16, same "
+                         "as the bf16 model dir).")
+    ap.add_argument("--decoder-quant", choices=["nf4", "fp8", "bf16"], default=None,
+                    help="Decoder/SigVQ/VAE source override (falls back to "
+                         "--quant). Note: the released NF4 and bf16 model "
+                         "dirs ship identical bf16 decoder weights, so this "
+                         "is mostly forward-compatible plumbing.")
     ap.add_argument("--model_path", default=None,
-                    help="Override auto-selected dir for --quant")
+                    help="Override auto-selected LLM dir.")
+    ap.add_argument("--decoder-model-path", default=None,
+                    help="Override auto-selected decoder dir.")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=7860)
@@ -1352,9 +1399,29 @@ def main() -> None:
                          "inline and never saved to disk.")
     args = ap.parse_args()
 
-    model_path = _ensure_model_path(args.quant, args.model_path)
+    # Resolve the per-component quants. Each falls back to the global --quant
+    # when the user didn't pin it, so a single --quant flag still does the
+    # expected thing.
+    llm_quant = args.llm_quant or args.quant
+    decoder_quant = args.decoder_quant or args.quant
+    model_path = _ensure_model_path(llm_quant, args.model_path)
+    if (decoder_quant == llm_quant
+            and args.decoder_model_path is None):
+        # Same source on both sides — no separate download required.
+        decoder_path = model_path
+    else:
+        decoder_path = _ensure_model_path(
+            decoder_quant, args.decoder_model_path,
+        )
+
+    if llm_quant != decoder_quant or model_path != decoder_path:
+        print(f"[Model] split sources: LLM={llm_quant} ({model_path}) · "
+              f"decoder={decoder_quant} ({decoder_path})")
+
     pipe = Pipeline(
-        model_path=model_path, quant=args.quant, device=args.device,
+        model_path=model_path, quant=llm_quant,
+        decoder_path=decoder_path, decoder_quant=decoder_quant,
+        device=args.device,
         low_vram=args.low_vram, lod=args.lod,
     )
     if args.low_vram:

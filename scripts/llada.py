@@ -331,7 +331,7 @@ def cmd_t2i(args: argparse.Namespace) -> None:
         res["token_ids"],
         res["h"],
         res["w"],
-        args.model_path,
+        args.decoder_model_path,
         device,
         resolution_multiplier=args.resolution_multiplier,
         num_steps=dec_steps,
@@ -429,7 +429,7 @@ def cmd_edit(args: argparse.Namespace) -> None:
     t0 = time.time()
     img = decode_vq_tokens(
         res["token_ids"], res["h"], res["w"],
-        args.model_path, device,
+        args.decoder_model_path, device,
         resolution_multiplier=args.resolution_multiplier,
         num_steps=dec_steps,
         decode_mode="decoder-turbo" if args.decoder_mode == "turbo" else "normal",
@@ -469,7 +469,7 @@ def cmd_decode(args: argparse.Namespace) -> None:
     t0 = time.time()
     img = decode_vq_tokens(
         token_ids, h, w,
-        args.model_path, device,
+        args.decoder_model_path, device,
         resolution_multiplier=args.resolution_multiplier,
         num_steps=dec_steps,
         decode_mode="decoder-turbo" if args.decoder_mode == "turbo" else "normal",
@@ -536,11 +536,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     def _common(sub):
         sub.add_argument("--quant", choices=["nf4", "fp8", "bf16"], default=DEFAULT_QUANT,
-                         help="LLM backbone precision. nf4=fastest load+lowest VRAM, "
-                              "fp8=highest quality but ~200s inline quant, bf16=full-precision.")
+                         help="Global precision applied to BOTH LLM and decoder side "
+                              "unless overridden by --llm-quant / --decoder-quant. "
+                              "nf4=fastest load+lowest VRAM, fp8=highest quality but "
+                              "~200s inline quant, bf16=full-precision.")
+        sub.add_argument("--llm-quant", choices=["nf4", "fp8", "bf16"], default=None,
+                         help="LLM precision override (falls back to --quant).")
+        sub.add_argument("--decoder-quant", choices=["nf4", "fp8", "bf16"], default=None,
+                         help="Decoder/SigVQ/VAE source override (falls back to --quant).")
         sub.add_argument("--model_path", default=None,
-                         help="Override auto-selected dir (normally picked from --quant). "
-                              "Must contain LLM + image_tokenizer/ + decoder/ + decoder-turbo/ + vae/.")
+                         help="Override auto-selected LLM dir.")
+        sub.add_argument("--decoder_model_path", default=None,
+                         help="Override auto-selected decoder dir (defaults to --model_path).")
         sub.add_argument("--output", default=None, help="Output path (auto-generated if omitted)")
         sub.add_argument("--seed", type=int, default=42)
         sub.add_argument("--device", default="cuda")
@@ -637,19 +644,49 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _resolve_model_path(args: argparse.Namespace) -> None:
-    """Resolve --model_path for the chosen --quant, downloading if needed."""
+    """Resolve --model_path / --decoder_model_path for the chosen quants.
+
+    Each side falls back to the global ``--quant`` when the user didn't pin
+    it explicitly. Downloads any missing weights via ``_ensure_model_path``.
+    Always populates ``args.decoder_quant`` / ``args.decoder_model_path``,
+    even on subcommands (info, download) that don't expose those flags.
+    """
     allow = getattr(args, "_allow_download", True)
+
+    llm_quant = getattr(args, "llm_quant", None) or args.quant
+    decoder_quant = getattr(args, "decoder_quant", None) or args.quant
+    args.llm_quant = llm_quant
+    args.decoder_quant = decoder_quant
+
     try:
         args.model_path = _ensure_model_path(
-            args.quant, getattr(args, "model_path", None),
+            llm_quant, getattr(args, "model_path", None),
             allow_download=allow,
         )
     except FileNotFoundError:
         # ``info`` uses allow=False; fall back to the canonical path so the
         # command can still report "directory does not exist".
         args.model_path = (
-            getattr(args, "model_path", None) or MODEL_PATHS[args.quant]
+            getattr(args, "model_path", None) or MODEL_PATHS[llm_quant]
         )
+
+    user_decoder_path = getattr(args, "decoder_model_path", None)
+    if decoder_quant == llm_quant and user_decoder_path is None:
+        # Same source on both sides — reuse whatever we just resolved.
+        args.decoder_model_path = args.model_path
+    else:
+        try:
+            args.decoder_model_path = _ensure_model_path(
+                decoder_quant, user_decoder_path, allow_download=allow,
+            )
+        except FileNotFoundError:
+            args.decoder_model_path = (
+                user_decoder_path or MODEL_PATHS[decoder_quant]
+            )
+
+    # Keep the legacy ``args.quant`` attr aligned with what actually drove
+    # LLM selection so downstream metadata logging stays consistent.
+    args.quant = llm_quant
 
 
 def main() -> None:
